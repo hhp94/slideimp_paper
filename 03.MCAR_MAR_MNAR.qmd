@@ -1,0 +1,695 @@
+---
+title: "MCAR/MAR/MNAR"
+format: html
+editor: source
+---
+
+# Synopsis
+Use `{missMethods}` to ampute the data given structure. We will be focusing on random probes and synthesize the estimates for simulations.
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(missMethods)
+library(RcppArmadillo)
+library(ggplot2)
+library(slideimp)
+library(qs2)
+library(forcats)
+library(matrixStats)
+library(duckdb)
+source("utils.R")
+theme_set(theme_bw())
+```
+
+Get the clocks CpGs used by the Horvath's server here: `https://dnamage.clockfoundation.org/`
+```{r}
+if (!file.exists(here::here("data", "datMiniAnnotation4_fixed.csv"))) {
+  download.file(
+    "https://www.dropbox.com/s/k1ezuqtn7uedyy5/datMiniAnnotation4_fixed.csv?dl=1",
+    destfile = here::here("data", "datMiniAnnotation4_fixed.csv")
+  )
+}
+
+con <- dbConnect(duckdb())
+
+horvath_cpgs <- readr::read_csv(
+  here::here("data", "datMiniAnnotation4_fixed.csv")
+) |>
+  filter(
+    Source %in% c(
+      "datMiniAnnotation3_defaultPredictions"
+      # , "RobustClocks"
+    )
+  )
+
+dbWriteTable(con, "horvath_cpgs", distinct(select(horvath_cpgs, Name)))
+
+query <- dbGetQuery(
+  con,
+  glue::glue_sql(
+    "
+    SELECT m.IlmnID, m.Name, m.CHR AS chr
+    FROM read_parquet({mani}) AS m
+    INNER JOIN horvath_cpgs AS h
+    ON h.Name = m.Name
+    ",
+    .con = con,
+    mani = get_manifest("EPICv2")
+  )
+) |>
+  inner_join(
+    horvath_cpgs,
+    by = "Name",
+    relationship = "many-to-many"
+  ) |>
+  mutate(chr = glue::glue("chr{chr}")) |>
+  filter(chr %in% glue::glue("chr{c(1:22, 'X', 'Y', 'M')}")) |>
+  as_tibble()
+
+EPICv2_cpgs_tbl <- select(query, IlmnID, chr) |>
+  unique() |>
+  nest(.by = "chr") |>
+  mutate(
+    cpgs = map2(
+      chr,
+      data,
+      \(x, y) {
+        mat <- qs_read(get_DNAm("EPICv2", x)$path)
+        matched <- intersect(y$IlmnID, row.names(mat))
+        colIQRs(t(mat[matched, ]), na.rm = TRUE)
+      }
+    )
+  )
+
+EPICv2_cpgs_tbl$data <- NULL
+EPICv2_cpgs_tbl$IlmnID <- lapply(EPICv2_cpgs_tbl$cpgs, names)
+EPICv2_cpgs_tbl$iqr <- map2(EPICv2_cpgs_tbl$cpgs, EPICv2_cpgs_tbl$IlmnID, \(x, y) {
+  tibble(iqr = x, IlmnID = y)
+})
+EPICv2_cpgs_tbl[, c("IlmnID", "cpgs", "chr")] <- NULL
+
+EPICv2_cpgs_stats <- inner_join(
+  query,
+  unnest(EPICv2_cpgs_tbl, cols = c("iqr")),
+  by = "IlmnID"
+) |>
+  filter(!is.na(iqr))
+
+# We see that the IQR of the selected probes for clocks is higher than the usual IQR.
+
+# this is because enet has to select for probes with higher variance (look at the covariance formula)
+EPICv2_cpgs_stats |>
+  ggplot(aes(x = iqr)) +
+  geom_density(aes(color = Source))
+```
+
+```{r}
+set.seed(1234)
+# simulation parameters
+
+force <- FALSE # force re-evaluation of cached objects
+n_cpg <- 500
+snr <- c(0.1) # SNR ratio between beta and sigma
+pr <- c(0.2, 0.3, 0.4, 0.5, 0.6, 0.7) # Probe-wise probability of missing. Stop at 0.7 because higher value may break the algorithm
+eff <- 0.1
+rep <- seq_len(1000) # Number of Monte Carlo replicates
+```
+
+```{r}
+# Load in data
+GSE264438_chr1 <- qs_read(get_DNAm("MSA", "chr1")$path[[1]])
+GSE264438_chr1_miss <- is.na(GSE264438_chr1)
+GSE264438_chr1 <- GSE264438_chr1[
+  (rowSums(GSE264438_chr1_miss) / ncol(GSE264438_chr1_miss)) < 0.9,
+] |> t()
+
+# rownames(GSE264438_chr1) <- NULL
+n_samples <- nrow(GSE264438_chr1)
+```
+
+We use sampling importance resampling (SIR) to draw values from the iqr of MSA that matches the iqr of the chosen EPICv2 CpGs. The algorithm is simple, extrapolate the density of the EPICv2 IQR distribution to match that of the MSA. Then upweights the values of the MSA density that has higher density in the EPICv2 IQR distribution. Then just resample the MSA based on the calculated upweights.
+
+```{r}
+# EPICv2_chosen_iqr
+EPICv2_chosen_iqr <- EPICv2_cpgs_stats$iqr
+# MSA_chr1_iqr
+GSE264438_chr1_iqr <- colIQRs(GSE264438_chr1, na.rm = TRUE)
+# Estimate the emperical density of both random variables
+EPICv2_d <- density(EPICv2_chosen_iqr)
+MSA_d <- density(GSE264438_chr1_iqr, bw = EPICv2_d$bw)
+# Interpolate the density to nearest values in GSE264438_chr1_iqr
+target_dens <- approx(EPICv2_d$x, EPICv2_d$y, GSE264438_chr1_iqr, rule = 2)$y
+proposal_dens <- approx(MSA_d$x, MSA_d$y, GSE264438_chr1_iqr, rule = 2)$y
+proposal_dens[proposal_dens < 1e-10] <- 1e-10
+# now we can calculate the weights to do resampling of chr1 iqr by
+weights <- target_dens / proposal_dens
+probs <- weights / sum(weights)
+# should replace = TRUE, but this is fine for now
+set.seed(1234)
+MSA_cpgs <- sample(GSE264438_chr1_iqr, size = n_cpg, replace = FALSE, prob = probs)
+sum(names(MSA_cpgs) %in% colnames(GSE264438_chr1))
+
+# check the density to make sure they match
+density_tbl <- tibble(
+  x = c(EPICv2_d$x, MSA_d$x, density(MSA_cpgs)$x),
+  y = c(EPICv2_d$y, MSA_d$y, density(MSA_cpgs)$y),
+  label = c(
+    rep("EPICv2 Chosen Probes", length(EPICv2_d$y)),
+    rep("MSA IQR", length(MSA_d$y)),
+    rep("MSA Chosen Probes", length(density(MSA_cpgs)$y))
+  )
+)
+
+plot(EPICv2_d, col = "blue", main = "IQR Densities")
+lines(MSA_d, col = "red")
+lines(density(MSA_cpgs), col = "green")
+legend(
+  "topright",
+  c("EPICv2 Probes", "MSA chr1 Probes", "Chosen MSA Probes"),
+  col = c("blue", "red", "green"),
+  lty = 1
+)
+```
+
+```{r}
+stopifnot(anyDuplicated(MSA_cpgs) == 0)
+cpgs <- names(MSA_cpgs)
+cpgs_idx <- colnames(GSE264438_chr1) %in% cpgs
+names(cpgs_idx) <- colnames(GSE264438_chr1)
+# Select the column that correlates with these CpGs as Xobs for MAR. To ensure MAR,
+# no cols_ctrl can be in cols_miss
+if (!file.exists(here::here("MCAR_MAR_MNAR", "03.cor_mat.qs2")) || force) {
+  cor_mat <- cor(
+    x = GSE264438_chr1[, cpgs],
+    y = GSE264438_chr1,
+    use = "pairwise.complete.obs"
+  )
+  qs2::qs_save(cor_mat, here::here("MCAR_MAR_MNAR", "03.cor_mat.qs2"))
+} else {
+  cor_mat <- qs2::qs_read(here::here("MCAR_MAR_MNAR", "03.cor_mat.qs2"))
+}
+# Choosing the control variables is also a bit nuanced. We don't want to cherry-pick
+# the control variables that favor our method. But also, if the situation
+# that favors our method *is* realistic, then the simulation is pointless. So, we
+# settle on a situation that would be unfavorable to our CpGs, but is also not too
+# unrealistic, i.e., we select columns that have "weak" correlation with our CpGs
+# as control variables. We define weak by CpGs that are correlated with our CpGs
+# between 0.1 and 0.3.
+# Initialize variables
+ctrl_cpgs <- character(length(cpgs))
+available_cpgs <- setdiff(colnames(cor_mat), cpgs) # Pool of available CpGs to choose from
+
+# Iterate through each target CpG to find a suitable ctrl CpG
+set.seed(1234)
+for (i in seq_along(cpgs)) {
+  # get correlations for this CpG with all available CpGs
+  correlations <- cor_mat[i, available_cpgs]
+
+  # get all CpGs with correlation between 0.1 and 0.4
+  valid_idx <- which(between(correlations, 0.1, 0.4))
+
+  if (length(valid_idx) == 0) {
+    stop(paste("No valid control CpGs found for CpG", cpgs[i], "at position", i))
+  }
+
+  # randomly select one from the valid CpGs
+  selected_idx <- sample(valid_idx, size = 1)
+  selected_cpg <- available_cpgs[selected_idx]
+
+  # add to ctrl_cpgs
+  ctrl_cpgs[i] <- selected_cpg
+
+  # remove from available pool
+  available_cpgs <- setdiff(available_cpgs, selected_cpg)
+}
+
+# verify uniqueness and no overlap with target CpGs
+stopifnot(length(ctrl_cpgs) == length(unique(ctrl_cpgs)))
+stopifnot(length(which(ctrl_cpgs %in% cpgs)) == 0)
+stopifnot(anyDuplicated(ctrl_cpgs) == 0)
+# ctrl_cpgs has to be completely observed. Also, to precisely control % missing
+# values in all involved cpgs, we impute all the involved CpGs. Note that the
+# correlation is now pre-imputations.
+
+GSE264438_chr1 <- knn_imp(
+  GSE264438_chr1,
+  colmax = 1,
+  k = 20,
+  cores = 8,
+  subset = c(cpgs, ctrl_cpgs)
+)
+
+# Quick check
+# cor_mat[1, "cg03123320_TC21"]
+
+# Simulate random weights for each CpG
+set.seed(1234)
+cpgs_weights <- rnorm(cpgs)
+
+# From this we can calculate the baseline clock
+clock <- rowSums(
+  sweep(GSE264438_chr1[, cpgs], 2, cpgs_weights, FUN = "*"),
+  na.rm = TRUE
+)
+```
+
+# Truth
+Work flow: generate estimates from truth table, which is un-amputated data.
+```{r}
+set.seed(2025)
+truth_tbl <- expand_grid(snr = snr, rep = rep, pr = 0) |>
+  mutate(
+    beta = eff,
+    sigma = eff / snr,
+    truth = map2(
+      beta,
+      sigma,
+      \(be, si) {
+        clock * be + rnorm(n_samples, sd = si)
+      }
+    )
+  )
+truth_tbl$clock <- list(clock)
+```
+
+```{r}
+lm_predict <- function(df, estimator) {
+  stopifnot(estimator %in% names(df))
+  df$fit <- map2(
+    df[[estimator]],
+    df$truth,
+    \(es, tr) {
+      fastLmPure(cbind(1, es), tr)
+    }
+  )
+  df$beta <- map_dbl(df$fit, \(x) {
+    x$coefficients[2]
+  })
+  df$se <- map_dbl(df$fit, \(x) {
+    x$stderr[2]
+  })
+  df[, c("truth", "fit", "estimator")] <- NULL
+  df <- pivot_longer(
+    df,
+    cols = c("beta", "se"),
+    names_to = "estimand",
+    values_to = "estimate"
+  )
+  return(df)
+}
+
+truth_tbl_viz <- lm_predict(truth_tbl, "clock") |>
+  mutate(pr = factor(pr)) |>
+  summarize(
+    lower = quantile(estimate, probs = c(0.025)),
+    mean = mean(estimate),
+    upper = quantile(estimate, probs = c(0.975)),
+    .by = c(snr, estimand, pr)
+  )
+
+truth_tbl_viz$scenario <- "truth"
+truth_tbl_viz$method <- "truth"
+```
+
+```{r}
+subset(lm_predict(truth_tbl, "clock"), estimand == "beta") |>
+  ggplot(aes(x = estimand, y = estimate)) +
+  ggdist::stat_halfeye()
+
+subset(truth_tbl_viz, estimand == "beta") |>
+  ggplot(aes(x = estimand, y = mean)) +
+  geom_pointrange(aes(ymin = lower, ymax = upper)) +
+  facet_wrap(~snr)
+
+subset(truth_tbl_viz, estimand == "se") |>
+  ggplot(aes(x = estimand, y = mean)) +
+  geom_pointrange(aes(ymin = lower, ymax = upper)) +
+  facet_wrap(~snr, scales = "free_y")
+```
+
+# Scenario
+## Script
+```{r}
+# init ----
+scenario <- expand_grid(select(truth_tbl, snr, rep, truth), pr = pr)
+set.seed(1234)
+scenario$seed <- sample.int(10000, nrow(scenario))
+scenario$rowid <- seq_len(nrow(scenario))
+```
+
+```{r, eval = F}
+qs_save(scenario, here::here("MCAR_MAR_MNAR", "input", "scenario.qs2"))
+qs_save(GSE264438_chr1, here::here("MCAR_MAR_MNAR", "input", "GSE264438_chr1.qs2"))
+qs_save(cpgs, here::here("MCAR_MAR_MNAR", "input", "cpgs.qs2"))
+qs_save(ctrl_cpgs, here::here("MCAR_MAR_MNAR", "input", "ctrl_cpgs.qs2"))
+qs_save(cpgs_weights, here::here("MCAR_MAR_MNAR", "input", "cpgs_weights.qs2"))
+```
+
+```{r simulations.R, eval = F}
+library(argparser)
+library(tidyverse)
+library(slideimp)
+library(RcppArmadillo)
+library(qs2)
+library(impute)
+library(missMethods)
+library(glue)
+library(fst)
+
+p <- arg_parser("simulations")
+p <- add_argument(p, "--scenario", help = "Path to scenario RDS file")
+p <- add_argument(
+  p, "--data",
+  help = "Path to data `GSE264438_chr1.qs2` file (GSE264438_chr1)"
+)
+p <- add_argument(p, "--cpgs", help = "Path to `cpgs.qs2` file")
+p <- add_argument(p, "--ctrl_cpgs", help = "Path to `ctrl_cpgs.qs2` file")
+p <- add_argument(p, "--cpgs_weights", help = "Path to `cpgs_weights.qs2` file")
+p <- add_argument(p, "--cores", help = "Number of cores", type = "integer", default = 1)
+p <- add_argument(p, "--k", help = "Number of neighbors", type = "integer", default = 25)
+p <- add_argument(p, "--ncp", help = "Number of pc", type = "integer")
+p <- add_argument(p, "--job", help = "Job", nargs = Inf, type = "numeric")
+p <- add_argument(p, "--out", help = "Output directory")
+
+argv <- parse_args(
+  p
+  # ,
+  # c(
+  #   "--scenario", here::here("MCAR_MAR_MNAR", "input", "scenario.qs2"),
+  #   "--data", here::here("MCAR_MAR_MNAR", "input", "GSE264438_chr1.qs2"),
+  #   "--cpgs", here::here("MCAR_MAR_MNAR", "input", "cpgs.qs2"),
+  #   "--ctrl_cpgs", here::here("MCAR_MAR_MNAR", "input", "ctrl_cpgs.qs2"),
+  #   "--cpgs_weights", here::here("MCAR_MAR_MNAR", "input", "cpgs_weights.qs2"),
+  #   "--cores", "1",
+  #   "--k", "25",
+  #   "--ncp", "30",
+  #   "--job", "1", "2",
+  #   "--out", here::here("MCAR_MAR_MNAR", "output")
+  # )
+)
+
+# Load objects from arguments
+scenario <- qs_read(argv$scenario)
+GSE264438_chr1 <- qs_read(argv$data)
+cpgs <- qs_read(argv$cpgs)
+ctrl_cpgs <- qs_read(argv$ctrl_cpgs)
+cpgs_weights <- qs_read(argv$cpgs_weights)
+cores <- argv$cores
+k <- argv$k
+ncp <- argv$ncp
+jobs <- argv$job
+job_id <- paste(jobs, collapse = "_")
+scenario <- subset(scenario, rowid %in% jobs)
+
+# create `definition_table`
+definition_table <- expand_grid(
+  method = fct_inorder(c(
+    "mean",
+    "si_brute",
+    "si_tree",
+    "si_pca"
+  )),
+  estimand = fct_inorder(c("beta", "se")),
+  scenario = fct_inorder(c("MCAR", "MAR", "MNAR"))
+)
+definition_table$label <- with(
+  definition_table,
+  glue::glue("{method}_{estimand}_{scenario}")
+)
+definition_table$results <- list(
+  rep(NA_real_, times = length(jobs))
+)
+definition_table$rowid <- list(jobs)
+definition_table$job_id <- job_id
+names(definition_table$results) <- definition_table$label
+stopifnot(anyDuplicated(scenario$seed) == 0)
+
+definition_table <- arrange(definition_table, scenario, method, estimand)
+scenario_order <- c("MCAR", "MAR", "MNAR")
+
+# extract and pool function for linear model results
+lm_extract <- function(x) {
+  # fit models to each imputed dataset
+  estimates <- lapply(x, function(y) {
+    fastLmPure(cbind(1, y), scenario$truth[[i]])
+  })
+  # pool results only if multiple imputations (length > 1)
+  if (length(estimates) > 1) {
+    # Extract coefficients and standard errors
+    beta <- vapply(estimates, function(y) y$coefficients[2], numeric(1))
+    se <- vapply(estimates, function(y) y$stderr[2], numeric(1))
+    # Pool using Rubin's rules
+    pooled_beta <- mean(beta)
+    pooled_se <- sqrt(mean(se^2) + var(beta) * (1 + 1 / length(estimates)))
+    return(list(coefficients = pooled_beta, stderr = pooled_se))
+  } else {
+    # single imputation just get the first result
+    return(list(
+      coefficients = estimates[[1]]$coefficients[2],
+      stderr = estimates[[1]]$stderr[2]
+    ))
+  }
+}
+
+#' helper function to process imputation results and fit models
+#'
+#' @param imputation_func an imputation function that takes in
+#' a matrix with missing, do imputation, and return a list
+#' @param method_name must fit the name in the `definition_table`
+process_imputation <- function(imputation_func, method_name) {
+  # call imputation function on each scenario of missing data
+  imputed_scenarios <- lapply(ampute_list, imputation_func)
+  # fit lm and pool results if multiple imputations
+  results <- lapply(imputed_scenarios, lm_extract)
+  # then store the results in definition_table
+  for (j in names(results)) {
+    label_beta <- paste(method_name, "beta", j, sep = "_")
+    label_se <- paste(method_name, "se", j, sep = "_")
+    stopifnot(all(c(label_beta, label_se) %in% names(definition_table$results)))
+    definition_table$results[[label_beta]][i] <<- results[[j]]$coefficients
+    definition_table$results[[label_se]][i] <<- results[[j]]$stderr
+  }
+}
+
+# imputation functions ----
+# return a list of imputed values to fit the API from process_imputation
+## mean ----
+mean_fn <- function(x) {
+  imputed_clocks <- rowSums(
+    sweep(
+      mean_imp_col(x, subset = cpgs)[, cpgs],
+      2,
+      cpgs_weights,
+      FUN = "*"
+    ),
+    na.rm = FALSE
+  )
+  return(list(imputed_clocks)) # Return as list of length 1
+}
+
+# si_brute ----
+si_brute_fn <- function(x) {
+  imputed_clocks <- rowSums(
+    sweep(
+      knn_imp(x, k = k, subset = cpgs, cores = cores)[, cpgs],
+      2,
+      cpgs_weights,
+      FUN = "*"
+    ),
+    na.rm = FALSE
+  )
+  return(list(imputed_clocks))
+}
+
+# si_tree ----
+si_tree_fn <- function(x) {
+  imputed_clocks <- rowSums(
+    sweep(
+      knn_imp(x, k = k, subset = cpgs, tree = "ball", cores = cores)[, cpgs],
+      2,
+      cpgs_weights,
+      FUN = "*"
+    ),
+    na.rm = FALSE
+  )
+  return(list(imputed_clocks)) # Return as list of length 1
+}
+
+# si_pca ----
+si_pca_fn <- function(x) {
+  imputed_clocks <- rowSums(
+    sweep(
+      pca_imp(x, ncp = ncp)[, cpgs],
+      2,
+      cpgs_weights,
+      FUN = "*"
+    ),
+    na.rm = FALSE
+  )
+  return(list(imputed_clocks)) # Return as list of length 1
+}
+
+for (i in seq_len(nrow(scenario))) {
+  # For loop here
+  # Step 1: Ampute
+  message("Processing row: ", i, "/", nrow(scenario))
+  set.seed(scenario$seed[i])
+  ampute_list <- list(
+    ampute_MCAR = missMethods::delete_MCAR(
+      GSE264438_chr1,
+      cols_mis = cpgs,
+      p = scenario$pr[i]
+    ),
+    ampute_MAR = missMethods::delete_MAR_1_to_x(
+      GSE264438_chr1,
+      cols_mis = cpgs,
+      cols_ctrl = ctrl_cpgs,
+      x = 2, # group 1 is 1/2 as likely as group 2.
+      # Higher value = stronger MAR. Can't be too high or break the algorithm
+      p = scenario$pr[i]
+    ),
+    ampute_MNAR = missMethods::delete_MNAR_1_to_x(
+      GSE264438_chr1,
+      cols_mis = cpgs,
+      x = 2, # same as MAR
+      # also controls p
+      p = scenario$pr[i]
+    )
+  )
+  names(ampute_list) <- scenario_order
+
+  # Imputation ----
+  # Step 2: Apply all imputation methods
+  process_imputation(mean_fn, "mean")
+  process_imputation(si_brute_fn, "si_brute")
+  process_imputation(si_tree_fn, "si_tree")
+  process_imputation(si_pca_fn, "si_pca")
+}
+
+definition_table$data <- purrr::map2(
+  definition_table$results,
+  definition_table$rowid,
+  \(x, y) {
+    tibble::tibble(estimate = x, rowid = y)
+  }
+)
+
+definition_table[, c("results", "rowid")] <- NULL
+definition_table <- tidyr::unnest(definition_table, cols = data)
+
+# Save. Need output out with definition_table to argv$out and job_id in path.qs2
+write_fst(
+  definition_table,
+  file.path(argv$out, paste("definition_table", job_id, "fst", sep = "."))
+)
+```
+
+## dSQ
+```{r, eval = F}
+splitIndices1 <- function(nx, ncl) {
+  nx <- as.integer(nx)
+  ncl <- as.integer(ncl)
+  stopifnot(`nx and ncl must be non negative` = nx > 0 & ncl >
+    0)
+  div <- nx %/% ncl
+  mod <- nx %% ncl
+  i <- seq_len(nx)
+  r <- sort(c(rep(seq_len(ncl), each = div), seq_len(mod)))
+  return(unname(split(i, f = factor(r))))
+}
+
+joblist <- lapply(
+  splitIndices1(nrow(scenario), 3000),
+  \(x) glue::glue(
+    "
+  apptainer exec $APPTAINER/missRanger/missRanger.sif Rscript simulations.R --scenario input/scenario.qs2 --data input/GSE264438_chr1.qs2 --cpgs input/cpgs.qs2 --ctrl_cpgs input/ctrl_cpgs.qs2 --cpgs_weights input/cpgs_weights.qs2 --cores 1 --k 25 --ncp 30 --job {paste(x, collapse = ' ')} --out output
+  "
+  )
+)
+
+readr::write_lines(
+  paste(joblist, collapse = "\n"),
+  "MCAR_MAR_MNAR/input/joblist.txt"
+)
+
+dsq_gen(
+  job_file = "joblist.txt",
+  batch_file = "simulations.sh",
+  job_name = "simulations",
+  output = "dSQ/dsq-jobfile-%A_%a-%N.out",
+  max_jobs = 200,
+  status_dir = "out",
+  slurm_args = slurm_par(time = "04:00:00", mem = "10G")
+)
+```
+
+### test
+Profile memory useage and speed
+```{bash, eval = F}
+#!/bin/bash
+#SBATCH --job-name=task
+#SBATCH --output=./slurm-%j.out
+#SBATCH --time=00:30:00
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=20G
+#SBATCH --partition=day
+#SBATCH --mail-type=END
+
+# Execute the bash script within the container
+apptainer exec $APPTAINER/missRanger/missRanger.sif Rscript simulations.R --scenario input/scenario.qs2 --data input/GSE264438_chr1.qs2 --cpgs input/cpgs.qs2 --ctrl_cpgs input/ctrl_cpgs.qs2 --cpgs_weights input/cpgs_weights.qs2 --cores 1 --k 25 --ncp 30 --job 1 2 --out output
+
+```
+
+# Simulation Results
+```{r, eval = F}
+results <- tibble::tibble(
+  files = list.files("MCAR_MAR_MNAR/output"),
+  paths = list.files("MCAR_MAR_MNAR/output", full.names = TRUE)
+)
+
+results$results <- lapply(results$paths, fst::read_fst)
+
+results_full <- list_rbind(results$results)
+results_full$job_id <- NULL
+truth_full <- lm_predict(truth_tbl, "clock")
+
+analysis_table <- inner_join(select(scenario, -truth), results_full, by = "rowid") |>
+  add_row(
+    mutate(
+      truth_full,
+      rowid = 0,
+      scenario = factor("truth"),
+      label = "truth",
+      method = factor("truth"),
+      sigma = NULL,
+      clock = NULL
+    )
+  ) |>
+  mutate(across(where(is.factor), as.character))
+
+fst::write_fst(analysis_table, here::here("MCAR_MAR_MNAR", "03.analysis_table.fst"))
+```
+
+```{r}
+analysis_table <- read_fst(here::here("MCAR_MAR_MNAR", "03.analysis_table.fst"))
+analysis_table_viz <- analysis_table |>
+  mutate(pr = factor(pr)) |>
+  summarize(
+    lower = quantile(estimate, probs = c(0.025)),
+    mean = mean(estimate),
+    upper = quantile(estimate, probs = c(0.975)),
+    .by = c(snr, estimand, pr, method, scenario)
+  ) |>
+  bind_rows(truth_tbl_viz) |>
+  mutate(
+    method = fct_relevel(method, "truth", levels(analysis_table$method)),
+    scenario = fct_relevel(scenario, "truth", levels(analysis_table$scenario)),
+    pr = fct_inseq(as.character(pr)),
+    tree = if_else(stringr::str_detect(method, "tree"), TRUE, FALSE)
+  )
+```
+

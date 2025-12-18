@@ -1,0 +1,1135 @@
+---
+title: "Benchmark"
+author: Hung
+date: "`r Sys.Date()`"
+format:
+  html:
+    fig-align: center
+    toc: true
+    toc-depth: 2
+    fig-height: 4
+    fig-width: 6
+    number-sections: true
+    toc-location: left
+    page-layout: full
+execute:  
+  echo: false  
+  warning: false
+  message: false
+---
+
+# Synopsis
+This file performs the benchmarks
+
+# Scenario
+```{r}
+#| eval: true
+# Install packages if needed
+pkgs <- list(
+  cran = c("missMDA", "softImpute", "missRanger"),
+  bioc = c("methyLImp2", "impute"),
+  github = c("hhp94/slideimp")
+)
+
+if (!rlang::is_installed("BiocManager")) install.packages("BiocManager")
+
+for (pkg in pkgs$cran) {
+  if (!rlang::is_installed(pkg)) install.packages(pkg)
+}
+
+for (pkg in pkgs$bioc) {
+  if (!rlang::is_installed(pkg)) BiocManager::install(pkg)
+}
+
+for (pkg in pkgs$github) {
+  pkg_name <- sub(".*/", "", pkg)
+  if (!rlang::is_installed(pkg_name)) remotes::install_github(pkg)
+}
+
+# Load libraries
+library(impute)
+library(slideimp)
+library(bench)
+library(here)
+library(qs2)
+library(duckdb)
+library(ggplot2)
+library(tidyverse)
+source("utils.R")
+```
+
+# Speed/Memory
+Perform imputation on just 1000 CpGs of chr22 of MSA chip
+```{r}
+library(missRanger)
+
+MSA_chr22 <- t(qs_read(get_DNAm("MSA", glue::glue("chr{22}"))$path)[1:1000, ])
+MSA_chr22_miss <- is.na(MSA_chr22)
+MSA_chr22 <- MSA_chr22[, colSums(MSA_chr22_miss) / nrow(MSA_chr22_miss) < 0.9]
+sum(MSA_chr22_miss) * 100 / length(MSA_chr22_miss)
+
+set.seed(1234)
+if (!file.exists("benchmark/rf_bench.rds")) {
+  rf_bench <- bench::mark(
+    missRanger(
+      as.data.frame(MSA_chr22),
+      num.threads = 6,
+      data_only = TRUE
+    ),
+    knn_imp(MSA_chr22, k = 20, cores = 6, weighted = TRUE, dist_pow = 1),
+    check = F
+  )
+  rf_bench$memory <- NULL
+  saveRDS(rf_bench, "benchmark/rf_bench.rds")
+} else {
+  rf_bench <- readRDS("benchmark/rf_bench.rds")
+}
+
+if (!file.exists("benchmark/rf_imp.rds")) {
+  rf_fns <- function(obj, ...) {
+    r <- missRanger(as.data.frame(obj), num.threads = 6, data_only = TRUE)
+    as.matrix(r)
+  }
+
+  set.seed(1234)
+  rf_imp <- tune_imp(
+    MSA_chr22,
+    .f = rf_fns,
+    parameters = data.frame(r = 1),
+    rep = 5,
+    num_na = 6000
+  )
+
+  set.seed(1234)
+  knn_imp_res <- tune_imp(
+    MSA_chr22,
+    .f = "knn_imp",
+    parameters = data.frame(k = 20, weighted = TRUE, dist_pow = 3),
+    rep = 5,
+    cores = 6,
+    num_na = 6000
+  )
+
+  saveRDS(rf_imp, "benchmark/rf_imp.rds")
+  saveRDS(knn_imp_res, "benchmark/knn_imp_res.rds")
+} else {
+  rf_imp <- readRDS("benchmark/rf_imp.rds")
+  knn_imp_res <- readRDS("benchmark/knn_imp_res.rds")
+}
+
+met_set <- yardstick::metric_set(yardstick::mae, yardstick::rmse, yardstick::rsq)
+
+rf_imp$results <- lapply(
+  rf_imp$result,
+  \(x) {
+    met_set(x, truth = truth, estimate = estimate)
+  }
+)
+
+knn_imp_res$results <- lapply(
+  knn_imp_res$result,
+  \(x) {
+    met_set(x, truth = truth, estimate = estimate)
+  }
+)
+
+knn_imp_res <- unnest(knn_imp_res, cols = "results")
+subset(knn_imp_res) |>
+  summarize(mean = mean(.estimate), .by = ".metric")
+
+rf_imp <- unnest(rf_imp, cols = "results")
+subset(rf_imp) |>
+  summarize(mean = mean(.estimate), .by = ".metric")
+
+rf_bench
+```
+
+```{r, eval = F}
+EPIC_chr1 <- do.call(rbind, lapply(get_DNAm("EPICv1", c("chr1"))$path, qs_read))
+EPIC_chr1_miss <- is.na(EPIC_chr1)
+EPIC_chr1 <- EPIC_chr1[(rowSums(EPIC_chr1_miss) / ncol(EPIC_chr1_miss)) < 0.90, ]
+EPIC_chr1 <- EPIC_chr1[
+  which(!rownames(EPIC_chr1) %in% c("cg00391452", "cg02434099")),
+]
+stopifnot(all(!c("cg00391452", "cg02434099") %in% rownames(EPIC_chr1)))
+
+# Transposed version
+EPIC_chr1_t <- t(EPIC_chr1)
+```
+
+```{r, eval = F}
+f_impute.knn <- function(data, n_samples, k = 20, prop = 0.55, seed = 42) {
+  set.seed(seed)
+  if (n_samples > nrow(data)) {
+    n_samples <- nrow(data)
+  }
+
+  selected_rows <- sample.int(nrow(data), size = n_samples)
+  maxp <- if (nrow(data) <= 1500) {
+    1500
+  } else {
+    ceiling(prop * nrow(data))
+  }
+  suppressWarnings(impute.knn(data[selected_rows, ], k = k, maxp = maxp))
+}
+
+# Helper function to handle sampling of subset of CpGs and setup
+knn_helper <- function(data_t, n_samples, seed = 42) {
+  set.seed(seed)
+  if (n_samples > ncol(data_t)) n_samples <- ncol(data_t)
+  selected_cols <- sample.int(ncol(data_t), size = n_samples)
+  data_t[, selected_cols]
+}
+
+f_knn_brute <- function(
+  data_t,
+  n_samples,
+  k = 20,
+  seed = 42,
+  weighted = FALSE,
+  dist_pow = 1,
+  cores = 1
+) {
+  sampled_data <- knn_helper(data_t, n_samples, seed)
+
+  knn_imp(
+    sampled_data,
+    k = k,
+    cores = cores,
+    post_imp = TRUE,
+    dist_pow = dist_pow
+  )
+}
+
+f_knn_ball <- function(
+  data_t,
+  n_samples,
+  k = 20,
+  seed = 42,
+  weighted = FALSE,
+  cores = 1,
+  dist_pow = 1
+) {
+  sampled_data <- knn_helper(data_t, n_samples, seed)
+
+  knn_imp(
+    sampled_data,
+    k = k,
+    tree = "ball",
+    post_imp = TRUE,
+    cores = cores,
+    dist_pow = dist_pow
+  )
+}
+
+f_knn_kd <- function(
+  data_t,
+  n_samples,
+  k = 20,
+  seed = 42,
+  cores = 1,
+  weighted = FALSE,
+  dist_pow = 1
+) {
+  sampled_data <- knn_helper(data_t, n_samples, seed)
+
+  knn_imp(
+    sampled_data,
+    k = k,
+    tree = "kd",
+    cores = cores,
+    post_imp = TRUE,
+    dist_pow = dist_pow
+  )
+}
+
+f_pca <- function(
+  data_t,
+  n_samples,
+  k = 20,
+  seed = 42,
+  cores = 1,
+  weighted = FALSE,
+  dist_pow = 1
+) {
+  sampled_data <- knn_helper(data_t, n_samples, seed)
+
+  pca_imp(sampled_data, ncp = 2)
+}
+
+library(methyLImp2)
+
+f_methyLImp2 <- function(data_t, n_samples, seed = 42) {
+  sampled_data <- knn_helper(data_t, n_samples, seed)
+  methyLImp2(
+    input = sampled_data,
+    type = "user",
+    annotation = data.frame(cpg = colnames(sampled_data), chr = "chr1"),
+    BPPARAM = BiocParallel::SerialParam()
+  )
+}
+
+library(missMDA)
+
+f_imputePCA <- function(data_t, n_samples, seed = 42) {
+  sampled_data <- knn_helper(data_t, n_samples, seed)
+
+  imputePCA(X = sampled_data, ncp = 20)$completeObs
+}
+
+library(softImpute)
+
+f_softImpute <- function(data_t, n_samples, seed = 42) {
+  sampled_data <- knn_helper(data_t, n_samples, seed)
+  softImpute::softImpute(sampled_data, rank.max = 20, type = "svd")$x
+}
+```
+
+## EPIC
+```{r, eval = F}
+EPIC_500 <- mark(
+  f_impute.knn(EPIC_chr1, 500),
+  f_methyLImp2(EPIC_chr1_t, 500),
+  f_imputePCA(EPIC_chr1_t, 500),
+  f_pca(EPIC_chr1_t, 500),
+  f_knn_brute(EPIC_chr1_t, 500),
+  f_knn_brute(EPIC_chr1_t, 500, cores = 4),
+  min_iterations = 5,
+  check = F,
+  filter_gc = FALSE
+)
+
+EPIC_1000 <- mark(
+  f_impute.knn(EPIC_chr1, 1000),
+  f_methyLImp2(EPIC_chr1_t, 1000),
+  f_imputePCA(EPIC_chr1_t, 1000),
+  f_pca(EPIC_chr1_t, 1000),
+  f_knn_brute(EPIC_chr1_t, 1000),
+  f_knn_brute(EPIC_chr1_t, 1000, cores = 4),
+  min_iterations = 5,
+  check = F,
+  filter_gc = FALSE
+)
+
+EPIC_5000 <- mark(
+  f_impute.knn(EPIC_chr1, 5000),
+  f_methyLImp2(EPIC_chr1_t, 5000),
+  f_imputePCA(EPIC_chr1_t, 5000),
+  f_pca(EPIC_chr1_t, 5000),
+  f_knn_brute(EPIC_chr1_t, 5000),
+  f_knn_brute(EPIC_chr1_t, 5000, cores = 4),
+  f_knn_kd(EPIC_chr1_t, 5000, cores = 4),
+  f_knn_ball(EPIC_chr1_t, 5000, cores = 4),
+  min_iterations = 5,
+  check = F,
+  filter_gc = FALSE
+)
+
+EPIC_10000 <- mark(
+  f_impute.knn(EPIC_chr1, 10000),
+  f_methyLImp2(EPIC_chr1_t, 10000),
+  f_imputePCA(EPIC_chr1_t, 10000),
+  f_pca(EPIC_chr1_t, 10000),
+  f_knn_brute(EPIC_chr1_t, 10000),
+  f_knn_brute(EPIC_chr1_t, 10000, cores = 4),
+  f_knn_kd(EPIC_chr1_t, 10000, cores = 4),
+  f_knn_ball(EPIC_chr1_t, 10000, cores = 4),
+  min_iterations = 5,
+  memory = FALSE,
+  check = F,
+  filter_gc = FALSE
+)
+
+EPIC_20000 <- mark(
+  f_impute.knn(EPIC_chr1, 20000),
+  f_methyLImp2(EPIC_chr1_t, 20000),
+  f_imputePCA(EPIC_chr1_t, 20000),
+  f_pca(EPIC_chr1_t, 20000),
+  f_knn_brute(EPIC_chr1_t, 20000),
+  f_knn_brute(EPIC_chr1_t, 20000, cores = 4),
+  f_knn_kd(EPIC_chr1_t, 20000, cores = 4),
+  f_knn_ball(EPIC_chr1_t, 20000, cores = 4),
+  min_iterations = 5,
+  memory = FALSE,
+  check = F,
+  filter_gc = FALSE
+)
+
+EPIC_50000 <- mark(
+  f_impute.knn(EPIC_chr1, 50000),
+  f_methyLImp2(EPIC_chr1_t, 50000),
+  f_imputePCA(EPIC_chr1_t, 50000),
+  f_pca(EPIC_chr1_t, 50000),
+  f_knn_brute(EPIC_chr1_t, 50000),
+  f_knn_brute(EPIC_chr1_t, 50000, cores = 4),
+  f_knn_kd(EPIC_chr1_t, 50000, cores = 4),
+  f_knn_ball(EPIC_chr1_t, 50000, cores = 4),
+  min_iterations = 5,
+  memory = FALSE,
+  check = F,
+  filter_gc = FALSE
+)
+
+EPIC_75000 <- mark(
+  f_impute.knn(EPIC_chr1, 75000),
+  f_methyLImp2(EPIC_chr1_t, 75000),
+  f_imputePCA(EPIC_chr1_t, 75000),
+  f_pca(EPIC_chr1_t, 75000),
+  f_knn_brute(EPIC_chr1_t, 75000),
+  f_knn_brute(EPIC_chr1_t, 75000, cores = 4),
+  f_knn_kd(EPIC_chr1_t, 75000, cores = 4),
+  f_knn_ball(EPIC_chr1_t, 75000, cores = 4),
+  min_iterations = 5,
+  memory = FALSE,
+  check = F,
+  filter_gc = FALSE
+)
+```
+
+## Export
+```{r, eval = F}
+walk2(
+  list(
+    EPIC_500,
+    EPIC_1000,
+    EPIC_5000,
+    EPIC_10000,
+    EPIC_20000,
+    EPIC_50000,
+    EPIC_75000
+  ),
+  glue::glue("benchmark/EPIC_{c(500, 1000, 5000, 10000, 20000, 50000, 75000)}.qs2"),
+  \(x, y) {
+    x$memory <- NULL
+    qs2::qs_save(x, y)
+  }
+)
+```
+
+# Accuracy
+## Tune
+```{r tune_imp_mcar.R, eval =  F}
+library(argparser)
+library(impute)
+library(slideimp)
+library(qs2)
+library(tidyr)
+library(fst)
+library(yardstick)
+library(missMDA)
+library(mirai)
+library(dplyr)
+library(glue)
+
+p <- arg_parser("tune_imp")
+p <- add_argument(p, "--GSE", help = "GSE accession", type = "character")
+p <- add_argument(p, "--platform", help = "EPICv1/EPICv2", type = "character")
+p <- add_argument(p, "--chr", help = "chromosome", type = "character")
+p <- add_argument(p, "--output", help = "output file path", type = "character")
+p <- add_argument(p, "--cores", help = "n cores", type = "numeric")
+p <- add_argument(p, "--global_na", help = "global_na percentage", type = "numeric")
+p <- add_argument(p, "--debug", help = "debug mode", flag = TRUE)
+
+argv <- parse_args(
+  p
+  # ,
+  # c(
+  #   "--GSE", "GSE286313",
+  #   "--platform", "EPICv1",
+  #   "--chr", "22",
+  #   "--output", "benchmark",
+  #   "--cores", "7",
+  #   "--global_na", 0.05
+  #   # , "--debug"
+  # )
+)
+
+# input
+input_path <- glue(
+  "{argv$GSE}/{argv$platform}/{argv$GSE}.{argv$platform}_chr{argv$chr}.qs2"
+)
+
+stopifnot(file.exists(input_path))
+if (!dir.exists(argv$output)) {
+  dir.create(argv$output, recursive = TRUE)
+}
+
+# knn_imp params
+# knn_imp_param <- tidyr::expand_grid(
+#   k = c(3, 5, 7, 10),
+#   dist_pow = c(0, 2, 3, 4),
+#   method = c("euclidean"),
+#   post_imp = FALSE
+# )
+knn_imp_param <- tidyr::expand_grid(
+  k = c(10, 15, 20, 25),
+  dist_pow = c(0, 4, 6, 8),
+  method = c("euclidean"),
+  post_imp = FALSE
+)
+
+# pca_imp params. Features in columns
+pca_imp_param <- tidyr::expand_grid(
+  ncp = c(25, 30, 35),
+  coeff.ridge = c(0.75, 1, 1.25)
+)
+
+# input
+obj <- qs_read(input_path)
+
+# inject global NA level
+length_obj <- length(obj)
+set.seed(1234)
+dim(obj)
+obj[sample.int(length_obj, size = ceiling(argv$global_na * length_obj))] <- NA
+miss <- is.na(obj)
+obj <- obj[(rowSums(miss) / ncol(miss)) < 0.9, ]
+message("Actual global missing % is ", round((sum(is.na(obj)) * 100) / length(obj), 2))
+dim(obj)
+
+if (argv$debug) {
+  obj <- obj[1:1000, ]
+}
+obj_t <- t(obj)
+num_na <- if (argv$debug) {
+  10
+} else {
+  10000
+}
+
+# tuning
+set.seed(1234)
+knn_tune_results <- tune_imp(
+  obj = obj_t,
+  parameters = knn_imp_param,
+  .f = "knn_imp",
+  rep = 14,
+  num_na = num_na,
+  .progress = TRUE,
+  cores = argv$cores,
+  colmax = 0.91
+)
+
+# setup parallel
+daemons(argv$cores)
+
+set.seed(1234)
+pca_imp_tune_results <- tune_imp(
+  obj = obj_t,
+  parameters = pca_imp_param,
+  .f = "pca_imp",
+  rep = 14,
+  num_na = num_na,
+  .progress = TRUE,
+  colmax = 0.91
+)
+
+# shutdown parallel
+daemons(0)
+
+# Save results
+met_set <- metric_set(mae, rmse, rsq)
+
+# Process knn
+knn_tune_results$metrics <- lapply(
+  knn_tune_results$result,
+  function(x) {
+    met_set(x, truth = truth, estimate = estimate)
+  }
+)
+knn_tune_results$result <- NULL
+knn_tune_results <- tidyr::unnest(knn_tune_results, cols = "metrics")
+knn_tune_results <- dplyr::mutate(knn_tune_results, global_na = argv$global_na)
+
+write_fst(
+  knn_tune_results,
+  file.path(
+    argv$output,
+    glue::glue("knn_imp_tune_{argv$GSE}_chr{argv$chr}.{argv$global_na}.fst")
+  )
+)
+
+# Process pca_imp
+pca_imp_tune_results$metrics <- lapply(
+  pca_imp_tune_results$result,
+  function(x) {
+    met_set(x, truth = truth, estimate = estimate)
+  }
+)
+pca_imp_tune_results$result <- NULL
+pca_imp_tune_results <- tidyr::unnest(pca_imp_tune_results, cols = "metrics")
+pca_imp_tune_results <- dplyr::mutate(pca_imp_tune_results, global_na = argv$global_na)
+
+write_fst(
+  pca_imp_tune_results,
+  file.path(
+    argv$output,
+    glue::glue("pca_imp_tune_{argv$GSE}_chr{argv$chr}.{argv$global_na}.fst")
+  )
+)
+```
+
+```{bash, eval = F}
+#!/bin/bash
+#SBATCH --job-name=task
+#SBATCH --output=./slurm-%j.out
+#SBATCH --time=02:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=22
+#SBATCH --mem=50G
+#SBATCH --partition=day
+#SBATCH --mail-type=END
+
+# Execute the bash script within the container
+apptainer exec $APPTAINER/missRanger/missRanger.sif Rscript ./tune_imp_mcar.R \
+  --GSE GSE286313 \
+  --platform EPICv1 \
+  --chr "22" \
+  --output "benchmark" \
+  --cores 21 \
+  --global_na 0.05
+```
+
+## Fit
+Can't inject too much NA because without any cols without any NA, the imputation fails on `{methyLImp2}`
+
+```{r fit_imp_mcar.R}
+library(argparser)
+library(impute)
+library(slideimp)
+library(qs2)
+library(tidyr)
+library(fst)
+library(yardstick)
+library(missMDA)
+library(mirai)
+library(dplyr)
+library(glue)
+library(methyLImp2)
+library(BiocParallel)
+
+p <- arg_parser("fit_imp")
+p <- add_argument(p, "--GSE", help = "GSE accession", type = "character")
+p <- add_argument(p, "--platform", help = "EPICv1/EPICv2/MSA", type = "character")
+p <- add_argument(p, "--chr", help = "chromosome", type = "character")
+p <- add_argument(p, "--output", help = "output file path", type = "character")
+p <- add_argument(p, "--cores", help = "n cores", type = "numeric")
+p <- add_argument(
+  p, "--global_na",
+  help = "global_na percentages", type = "numeric", nargs = Inf
+)
+p <- add_argument(p, "--debug", help = "debug mode", flag = TRUE)
+
+argv <- parse_args(
+  p
+  # ,
+  # c(
+  #   "--GSE", "GSE286313",
+  #   "--platform", "EPICv1",
+  #   "--chr", "22",
+  #   "--output", "benchmark",
+  #   "--cores", "7",
+  #   "--global_na", c(0.01)
+  # )
+)
+
+input_path <- glue(
+  "{argv$GSE}/{argv$platform}/{argv$GSE}.{argv$platform}_chr{argv$chr}.qs2"
+)
+
+# File and directory validation
+stopifnot(file.exists(input_path))
+if (!dir.exists(argv$output)) {
+  dir.create(argv$output, recursive = TRUE)
+}
+
+# knn_imp params
+knn_imp_param <- tibble::tibble(
+  k = 20,
+  dist_pow = 4,
+  method = "euclidean",
+  post_imp = FALSE
+)
+
+# pca_imp params
+pca_imp_param <- tibble::tibble(
+  ncp = 30,
+  coeff.ridge = 1
+)
+
+methyLImp2_param <- tibble::tibble(id = 1)
+methyLImp2_wrap <- function(obj, id = NULL) {
+  methyLImp2::methyLImp2(
+    obj,
+    type = "user",
+    annotation = data.frame(cpg = colnames(obj), chr = "chr22"),
+    BPPARAM = BiocParallel::SerialParam()
+  )
+}
+# input
+obj <- qs_read(input_path)
+
+daemons(argv$cores)
+
+met_set <- metric_set(mae, rmse, rsq)
+global_na_percs <- argv$global_na
+seed <- 123456
+num_na <- if (argv$debug) {
+  10
+} else {
+  10000
+}
+rep <- if (argv$debug) {
+  1
+} else {
+  14
+}
+for (perc in global_na_percs) {
+  # Inject global NA level
+  set.seed(seed)
+  length_obj <- length(obj)
+  obj_temp <- obj
+  obj_temp[sample.int(length_obj, size = floor(perc * length_obj))] <- NA
+  miss <- is.na(obj_temp)
+  obj_temp <- obj_temp[(rowSums(miss) / ncol(miss)) < 0.9, ]
+  message(
+    "Actual global missing % is ",
+    round((sum(is.na(obj_temp)) * 100) / length(obj_temp), 2)
+  )
+  dim(obj_temp)
+  if (argv$debug) {
+    obj_temp <- obj_temp[1:1000, ]
+  }
+  obj_t <- t(obj_temp)
+  # knn
+  set.seed(seed)
+  knn_tune_results <- tune_imp(
+    obj = obj_t,
+    parameters = knn_imp_param,
+    .f = "knn_imp",
+    rep = rep,
+    num_na = num_na,
+    .progress = TRUE,
+    cores = argv$cores,
+    colmax = 0.91
+  )
+  knn_tune_results$metrics <- lapply(
+    knn_tune_results$result,
+    function(x) {
+      met_set(x, truth = truth, estimate = estimate)
+    }
+  )
+  knn_tune_results$result <- NULL
+  temp_knn <- tidyr::unnest(knn_tune_results, cols = "metrics")
+  temp_knn <- dplyr::mutate(temp_knn, global_na = perc)
+  write_fst(
+    temp_knn,
+    file.path(
+      argv$output,
+      glue::glue("knn_imp_fitted_{argv$GSE}_{argv$platform}_chr{argv$chr}.{perc}.fst")
+    )
+  )
+  # pca_imp
+  set.seed(seed)
+  pca_imp_tune_results <- tune_imp(
+    obj = obj_t,
+    parameters = pca_imp_param,
+    .f = "pca_imp",
+    rep = rep,
+    num_na = num_na,
+    .progress = TRUE,
+    cores = argv$cores,
+    colmax = 0.91
+  )
+  pca_imp_tune_results$metrics <- lapply(
+    pca_imp_tune_results$result,
+    function(x) {
+      met_set(x, truth = truth, estimate = estimate)
+    }
+  )
+  pca_imp_tune_results$result <- NULL
+  temp_pca_imp <- tidyr::unnest(pca_imp_tune_results, cols = "metrics")
+  temp_pca_imp <- dplyr::mutate(temp_pca_imp, global_na = perc)
+  write_fst(
+    temp_pca_imp,
+    file.path(
+      argv$output,
+      glue::glue("pca_imp_fitted_{argv$GSE}_{argv$platform}_chr{argv$chr}.{perc}.fst")
+    )
+  )
+  # methyLImp2
+  set.seed(seed)
+  methyLImp2_tune_results <- tune_imp(
+    obj = obj_t,
+    parameters = methyLImp2_param,
+    .f = methyLImp2_wrap,
+    rep = rep,
+    num_na = num_na,
+    .progress = TRUE,
+    cores = argv$cores,
+    colmax = 0.91
+  )
+  methyLImp2_tune_results$metrics <- lapply(
+    methyLImp2_tune_results$result,
+    function(x) {
+      met_set(x, truth = truth, estimate = estimate)
+    }
+  )
+  methyLImp2_tune_results$result <- NULL
+  temp_methyLImp2 <- tidyr::unnest(methyLImp2_tune_results, cols = "metrics")
+  temp_methyLImp2 <- dplyr::mutate(temp_methyLImp2, global_na = perc)
+  write_fst(
+    temp_methyLImp2,
+    file.path(
+      argv$output,
+      glue::glue(
+        "methyLImp2_fitted_{argv$GSE}_{argv$platform}_chr{argv$chr}.{perc}.fst"
+      )
+    )
+  )
+}
+
+daemons(0)
+```
+
+```{r}
+joblist <- glue::glue(
+  "apptainer exec $APPTAINER/missRanger/missRanger.sif Rscript fit_imp_mcar.R",
+  "--GSE GSE286313",
+  "--platform EPICv1",
+  "--chr 22",
+  "--output benchmark",
+  "--cores 14",
+  "--global_na {c(0, 0.01, 0.025, 0.05, 0.075, 0.1)}",
+  .sep = " "
+)
+
+# dsq_gen(
+#   "joblist.txt",
+#   batch_file = "fit_imp_mcar.sh",
+#   job_name = "fit_imp_mcar",
+#   output = "dSQ/dsq-jobfile-%A_%a-%N.out",
+#   max_jobs = 6,
+#   slurm_args = slurm_par(
+#     time = "02:00:00",
+#     cpus_per_task = "15",
+#     mem = "30G"
+#   )
+# )
+# dsq --job-file joblist.txt --batch-file fit_imp_mcar.sh --job-name fit_imp_mcar --max-jobs 6 --output dSQ/dsq-jobfile-%A_%a-%N.out --status-dir . --time 02:00:00 --nodes 1 --ntasks-per-node 1 --cpus-per-task 15 --mem 30G --partition day
+```
+
+## `group_imp`
+Benchmark accuracy of `group_imp` vs full `knn_imp` and `pca_imp` on the chromosome 1:22 of the MSA chip. Focus on values in just `300` random columns each with `20` values (6,000 missing values to measure RMSE/MAE/RSQ). Do this for multiple reps.
+
+```{r}
+# Get MSA data
+MSA <- get_DNAm("MSA", glue::glue("chr{c(1:22, 'X')}"))
+MSA$data <- lapply(MSA$path, qs2::qs_read)
+col_order <- colnames(MSA$data[[1]])
+MSA$data <- lapply(MSA$data, \(x) x[, col_order])
+stopifnot(length(unique(lapply(MSA$data, colnames))) == 1)
+
+MSA <- t(purrr::reduce(MSA$data, rbind))
+dim(MSA)
+miss <- is.na(MSA)
+MSA <- MSA[, (colSums(miss) / nrow(miss)) < 0.9]
+dim(MSA)
+cv <- col_vars(MSA)
+MSA <- MSA[, !(is.na(cv) & dplyr::near(cv, 0))]
+dim(MSA)
+
+# Get manifest. Needed for `group_imp`
+MSA_manifest <- arrow::read_parquet(get_manifest("MSA"))
+all_probes <- intersect(colnames(MSA), MSA_manifest$IlmnID)
+
+# Align
+MSA_manifest <- subset(MSA_manifest, IlmnID %in% all_probes)
+MSA <- MSA[, all_probes]
+
+# Select columns
+n_rep <- 30
+set.seed(1234)
+missing_2d <- tibble(
+  rep = seq_len(n_rep),
+  IlmnID = lapply(rep, \(x) sample(MSA_manifest$IlmnID, size = 300))
+) |>
+  unnest(cols = "IlmnID") |>
+  mutate(
+    col_index = match(IlmnID, colnames(MSA)),
+    row_index = lapply(IlmnID, \(x) {
+      # for each column, 20 values are missing
+      sample.int(nrow(MSA), size = 20)
+    })
+  ) |>
+  unnest(cols = "row_index")
+
+# linear = offset + row_index.
+missing_2d$linear_index <- (missing_2d$col_index - 1) * nrow(MSA) + missing_2d$row_index
+# sanity check on linear position to 2d position
+for (i in 1:100) {
+  v1 <- MSA[missing_2d$linear_index[i]]
+  v2 <- MSA[
+    missing_2d$row_index[i],
+    missing_2d$col_index[i]
+  ]
+  stopifnot(
+    v1 == v2 | is.na(v1) == is.na(v2)
+  )
+}
+
+# From here we can calculate the fixed NA positions
+na_positions <- missing_2d |>
+  select(rep, linear_index) |>
+  nest(.by = "rep") |>
+  mutate(data = lapply(data, \(x) {
+    x$linear_index
+  })) |>
+  arrange(rep)
+
+# Column subset
+nested_manifest <- nest(as_tibble(MSA_manifest), aux = IlmnID, .by = "CHR") |>
+  mutate(aux = lapply(aux, \(x) {
+    x$IlmnID
+  }))
+
+column_positions <- missing_2d |>
+  select(rep, IlmnID) |>
+  nest(.by = "rep") |>
+  mutate(data = lapply(data, \(x) {
+    unique(x$IlmnID)
+  })) |>
+  mutate(
+    group_df = lapply(data, \(x) {
+      mutate(nested_manifest, features = lapply(aux, \(y) {
+        intersect(x, y)
+      }))
+    })
+  ) |>
+  arrange(rep)
+
+dir.create("benchmark/group_imp/input")
+qs2::qs_save(na_positions, "benchmark/group_imp/input/na_positions.qs2")
+qs2::qs_save(column_positions, "benchmark/group_imp/input/column_positions.qs2")
+qs2::qs_save(MSA, "benchmark/group_imp/input/MSA.qs2")
+```
+
+### `group_imp.R`
+```{r, group_imp.R}
+library(argparser)
+library(tidyverse)
+library(slideimp)
+library(fst)
+library(glue)
+library(qs2)
+
+# Set up argument parser
+p <- arg_parser("Run group/full imputation with knn/pca method")
+p <- add_argument(p, "--na_positions", help = "Path to na_positions object")
+p <- add_argument(p, "--column_positions", help = "Path to column_position object")
+p <- add_argument(p, "--MSA", help = "Path to MSA object")
+p <- add_argument(p, "--cores", help = "Number of cores", type = "integer")
+p <- add_argument(p, "--output", help = "Output path")
+p <- add_argument(p, "--rep", help = "Repeat number", type = "integer")
+p <- add_argument(p, "--method", help = "Method: pca or knn")
+p <- add_argument(p, "--group", help = "Group type: group or full")
+
+argv <- parse_args(
+  p
+  # ,
+  # c(
+  #   "--na_positions", "benchmark/group_imp/input/na_positions.qs2",
+  #   "--column_positions", "benchmark/group_imp/input/column_positions.qs2",
+  #   "--MSA", "benchmark/group_imp/input/MSA.qs2",
+  #   "--cores", 7,
+  #   "--output", "benchmark/group_imp/output",
+  #   "--rep", 1,
+  #   "--method", "pca",
+  #   "--group", "group"
+  # )
+)
+
+# Check that paths exist
+stopifnot(file.exists(argv$na_position))
+stopifnot(file.exists(argv$column_position))
+stopifnot(file.exists(argv$MSA))
+stopifnot(dir.exists(argv$output))
+
+# Load data
+na_positions <- qs_read(argv$na_position)
+column_positions <- qs_read(argv$column_position)
+MSA <- qs_read(argv$MSA)
+
+# Output file path
+results <- file.path(argv$output, glue("{argv$method}-{argv$group}-{argv$rep}.fst"))
+
+# Set parameters
+k <- 25
+ncp <- 25
+
+set.seed(12345)
+# Wrapper functions
+group_imp_knn_wrap <- function(obj, group_df) {
+  imputed <- group_imp(
+    obj = obj,
+    k = k,
+    group = group_df,
+    cores = argv$cores
+  )[, colnames(obj)]
+  return(imputed)
+}
+
+group_imp_pca_wrap <- function(obj, group_df) {
+  imputed <- group_imp(
+    obj = obj,
+    ncp = ncp,
+    group = group_df
+  )[, colnames(obj)]
+  return(imputed)
+}
+
+knn_imp_wrap <- function(obj, subset) {
+  imputed <- knn_imp(
+    obj = obj,
+    k = k,
+    subset = subset,
+    cores = argv$cores
+  )
+  obj[, subset] <- imputed[, subset]
+  return(obj)
+}
+
+pca_imp_wrap <- function(obj, subset) {
+  imputed <- pca_imp(
+    obj = obj,
+    ncp = ncp
+  )[, colnames(obj)]
+  return(imputed)
+}
+
+# Get the data for this specific rep
+i <- argv$rep
+message("Processing rep ", i)
+
+# Get the linear position of missing for `tune_imp`
+position <- list(na_positions$data[[i]])
+# Get the column names for this rep
+subset <- list(column_positions$data[[i]])
+# Get the group_df for this rep
+group_df <- list(column_positions$group_df[[i]])
+
+# Run the appropriate combination based on method and group
+if (argv$method == "knn" && argv$group == "full") {
+  message("Running KNN Full")
+  tune_result <- tune_imp(
+    obj = MSA,
+    parameters = tibble::tibble(subset = subset),
+    .f = knn_imp_wrap,
+    rep = position
+  )
+  imputed <- tune_result$result[[1]]
+  
+} else if (argv$method == "knn" && argv$group == "group") {
+  message("Running KNN Group")
+  tune_result <- tune_imp(
+    obj = MSA,
+    parameters = tibble::tibble(group_df = group_df),
+    .f = group_imp_knn_wrap,
+    rep = position
+  )
+  imputed <- tune_result$result[[1]]
+  
+} else if (argv$method == "pca" && argv$group == "full") {
+  message("Running PCA Full")
+  tune_result <- tune_imp(
+    obj = MSA,
+    parameters = tibble::tibble(subset = subset),
+    .f = pca_imp_wrap,
+    rep = position
+  )
+  imputed <- tune_result$result[[1]]
+  
+} else if (argv$method == "pca" && argv$group == "group") {
+  message("Running PCA Group")
+  tune_result <- tune_imp(
+    obj = MSA,
+    parameters = tibble::tibble(group_df = group_df),
+    .f = group_imp_pca_wrap,
+    rep = position
+  )
+  imputed <- tune_result$result[[1]]
+  
+} else {
+  stop("Method must be 'knn' or 'pca', group must be 'full' or 'group'")
+}
+
+# Save results
+message("Saving results to ", results)
+write_fst(imputed, results)
+message("Done!")
+```
+
+### dSQ
+```{r}
+joblist_tbl <- tidyr::expand_grid(
+  "na_positions" = "input/na_positions.qs2",
+  "column_positions" = "input/column_positions.qs2",
+  "MSA" =  "input/MSA.qs2",
+  "output" = "output",
+  "rep" = 1:30,
+  "method" = c("pca", "knn"),
+  "group" = c("group", "full")
+)
+
+joblist_tbl$joblist <- with(
+  joblist_tbl, 
+  glue::glue(
+    "apptainer exec $APPTAINER/missRanger/missRanger.sif Rscript group_imp.R",
+    "--na_positions", "{na_positions}",
+    "--column_positions", "{column_positions}",
+    "--MSA", "{MSA}",
+    "--output", "{output}",
+    "--rep", "{rep}",
+    "--method", "{method}",
+    "--group", "{group}",
+    .sep = " "
+  )
+)
+
+# PCA runs on the HPC
+joblist_pca_tbl <- subset(joblist_tbl, method == "pca")
+
+readr::write_lines(joblist_pca_tbl$joblist, "benchmark/group_imp/joblist_pca.txt")
+dsq_gen(
+  "joblist_pca.txt",
+  batch_file = "group_imp.sh",
+  job_name = "group_imp",
+  output = "dSQ/dsq-jobfile-%A_%a-%N.out",
+  max_jobs = 30,
+  slurm_args = slurm_par(
+    time = "12:00:00",
+    cpus_per_task = "1",
+    mem = "30G"
+  )
+)
+# dsq --job-file joblist_pca.txt --batch-file group_imp.sh --job-name group_imp --max-jobs 30 --output dSQ/dsq-jobfile-%A_%a-%N.out --status-dir . --time 05:00:00 --nodes 1 --ntasks-per-node 1 --cpus-per-task 1 --mem 30G --partition day
+
+# KNN runs locally
+joblist_knn_tbl <- subset(joblist_tbl, method == "knn")
+joblist_knn_tbl$joblist <- glue::glue("{joblist_knn_tbl$joblist} --cores 7")
+extracted_string <- substr(joblist_knn_tbl$joblist, 53, nchar(joblist_knn_tbl$joblist))
+readr::write_lines(extracted_string, "benchmark/group_imp/joblist_knn.txt")
+
+file.edit("benchmark/group_imp/group_imp.R")
+file.edit("benchmark/group_imp/run_jobs.bat")
+```
+
+```{bat, run_jobs.bat}
+@echo off
+for /f "usebackq delims=" %%i in ("joblist_knn.txt") do (
+    echo Running: %%i
+    %%i
+)
+pause
+```

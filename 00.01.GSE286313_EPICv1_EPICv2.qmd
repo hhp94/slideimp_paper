@@ -1,0 +1,160 @@
+---
+title: "00.00.GSE286313.qmd"
+format: html
+editor: source
+---
+
+# Synopsis
+`GSE286313` EPIC/EPICv2 is good because it has both EPIC and EPICv2 data at a decent sample size and it is blood samples.
+
+# Metadata
+```{r}
+library(tidyverse)
+library(glue)
+source("utils.R")
+```
+
+```{r}
+if (!dir.exists("GSE286313")) {
+  dir.create("GSE286313")
+}
+if (!file.exists("GSE286313/GSE286313_gse.qs2")) {
+  if (!require(GEOquery)) {
+    BiocManager::install("GEOquery")
+  }
+  gse <- getGEO("GSE286313")
+  qs2::qs_save(gse, "GSE286313/GSE286313_gse.qs2")
+} else if (!file.exists("GSE286313/GSE286313_EPICv1_EPICv2_metadata.csv")) {
+  library(GEOquery)
+  gse <- qs2::qs_read("GSE286313/GSE286313_gse.qs2")
+}
+if (!file.exists("GSE286313/GSE286313_EPICv1_EPICv2_metadata.csv")) {
+  metadata <- lapply(gse, pData) |>
+    purrr::list_rbind() |>
+    dplyr::select(
+      title,
+      geo_accession,
+      description,
+      platform_id,
+      supplementary_file,
+      supplementary_file.1,
+      `age:ch1`,
+      `Sex:ch1`,
+      `tissue:ch1`
+    ) |>
+    janitor::clean_names() |>
+    as_tibble() |>
+    mutate(
+      across(
+        .cols = where(is.character),
+        .fns = \(x) stringr::str_squish(x)
+      ),
+      Age = as.numeric(age_ch1),
+      age_ch1 = NULL,
+      Female = if_else(sex_ch1 == "F", 1, 0),
+      sex_ch1 = NULL,
+      sentrix_barcode = str_sub(supplementary_file, -31, -13),
+      platform_id = NULL
+    ) |>
+    separate_wider_delim(
+      cols = description,
+      delim = ", ",
+      names = c("cohort", "platform"),
+      cols_remove = TRUE
+    ) |>
+    rename("tissue" = "tissue_ch1")
+
+  readr::write_csv(metadata, "GSE286313/GSE286313_EPICv1_EPICv2_metadata.csv")
+} else {
+  metadata <- readr::read_csv("GSE286313/GSE286313_EPICv1_EPICv2_metadata.csv")
+}
+```
+
+# Get Betas
+Download the `.idats` and get the betas.
+```{r, eval = F}
+# Create directory for IDAT files if it doesn't exist
+if (!dir.exists("GSE286313/idats")) {
+  dir.create("GSE286313/idats")
+}
+
+stopifnot(
+  all(
+    c(
+      str_detect(metadata$supplementary_file, metadata$sentrix_barcode),
+      str_detect(metadata$supplementary_file_1, metadata$sentrix_barcode)
+    )
+  )
+)
+
+metadata$Grn <- glue::glue("GSE286313/idats/{metadata$sentrix_barcode}_Grn.idat.gz")
+metadata$Red <- glue::glue("GSE286313/idats/{metadata$sentrix_barcode}_Red.idat.gz")
+
+force <- FALSE
+if (any(c(!file.exists(metadata$Grn), !file.exists(metadata$Red))) || force) {
+  library(furrr)
+  plan(multisession, workers = 6)
+  download_files <- function(i, metadata) {
+    green_path <- metadata$Grn[i]
+    red_path <- metadata$Red[i]
+    green_url <- metadata$supplementary_file[i]
+    red_url <- metadata$supplementary_file_1[i]
+
+    if (!file.exists(green_path)) {
+      download.file(green_url, green_path)
+    }
+    if (!file.exists(red_path)) {
+      download.file(red_url, red_path)
+    }
+  }
+
+  future_walk(
+    seq_len(nrow(metadata)),
+    \(x) {
+      download_files(x, metadata = metadata)
+    },
+    .progress = TRUE
+  )
+
+  plan(sequential)
+}
+
+# Get the EPICv1 and EPICv2 data separately
+BPPARAM <- BiocParallel::SnowParam(7, progressbar = TRUE)
+library(sesame)
+sesameDataCache()
+
+for (i in unique(metadata$platform)) {
+  out <- file.path("GSE286313", paste0("GSE286313", ".", i, ".qs2"))
+  if (!file.exists(out)) {
+    metadata_sub <- subset(metadata, platform == i)
+    idats_prefix <- paste("GSE286313", "idats", metadata_sub$sentrix_barcode, sep = "/")
+    names(idats_prefix) <- metadata_sub$sentrix_barcode
+    betas <- openSesame(idats_prefix, BPPARAM = BPPARAM)
+    qs2::qs_save(betas, out)
+  }
+}
+
+for (i in unique(metadata$platform)) {
+  root <- file.path("GSE286313", i)
+  if (!dir.exists(root)) {
+    dir.create(root)
+  }
+  manifest <- arrow::read_parquet(get_manifest(platform = i))
+  beta_matrix <- qs2::qs_read(
+    file.path("GSE286313", paste0("GSE286313", ".", i, ".qs2"))
+  )
+  matched_names <- intersect(manifest$IlmnID, rownames(beta_matrix))
+  rs <- grepv("^rs", matched_names)
+  matched_names <- setdiff(matched_names, rs)
+  beta_matrix <- beta_matrix[matched_names, ]
+  chrs <- unique(manifest$CHR)
+  for (j in chrs) {
+    manifest_sub <- subset(manifest, CHR == j & IlmnID %in% matched_names)
+    out <- file.path(root, paste0("GSE286313", ".", i, "_", "chr", j, ".qs2"))
+    if (!file.exists(out)) {
+      qs2::qs_save(beta_matrix[manifest_sub$IlmnID, ], out)
+    }
+  }
+}
+```

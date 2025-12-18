@@ -1,0 +1,72 @@
+---
+title: "GSE264438 MSA"
+format: html
+---
+
+# Synopsis
+`GSE264438` MSA is suitable for showcasing `group_imp` and used for the simulation.
+
+# Download
+```{r}
+library(tidyverse)
+library(glue)
+source("utils.R")
+if (!require(methylCIPHER)) {
+  remotes::install_github("hhp94/methylCIPHER", ref = "mod", force = TRUE)
+  library(methylCIPHER)
+}
+```
+
+# Clean pre-processed matrix
+```{r, eval = F}
+matrix_names <- c(
+  "GSE264438_GEOprocessed_matrix_GPL34394.csv.gz",
+  "GSE264438_GEO_processed_matrix_GPL34394_new_samples.csv.gz"
+)
+
+beta_matrix <- vector("list", length(matrix_names))
+na_matrix <- vector("list", length(matrix_names))
+
+for(i in seq_along(matrix_names)) {
+  print(matrix_names[i])
+  obj <- data.table::fread(glue::glue("GSE264438/{matrix_names[i]}"))
+  cnames <- colnames(obj)
+  sample_ids <- grepl("^[0-9]", cnames)
+  beta_matrix[[i]] <- as.matrix(obj[, .SD, .SDcols = names(obj)[sample_ids]])
+  p_vals_ids <- which(cnames == "Detection.Pval")
+  na_matrix[[i]] <- as.matrix(subset(obj, select = p_vals_ids))
+  beta_matrix[[i]][na_matrix[[i]] > 0.05] <- NA
+  row.names(beta_matrix[[i]]) <- obj$ID_REF
+  gc()
+}
+
+stopifnot(
+  isTRUE(
+    all.equal(
+      row.names(beta_matrix[[1]]),
+      row.names(beta_matrix[[2]])
+    )
+  )
+)
+
+GSE264438_beta_matrix <- cbind(beta_matrix[[1]], beta_matrix[[2]])
+qs2::qs_save(GSE264438_beta_matrix, "GSE264438/GSE264438_beta_matrix.qs2")
+```
+
+```{r}
+GSE264438_beta_matrix <- qs2::qs_read("GSE264438/GSE264438_beta_matrix.qs2")
+MSA_manifest <- as_tibble(arrow::read_parquet(get_manifest("MSA")))
+MSA_manifest$chr <- paste0("chr", MSA_manifest$CHR)
+chr_vec <- unique(MSA_manifest$chr)
+
+for(i in seq_along(chr_vec)) {
+  print(chr_vec[i])
+  MSA_sub <- dplyr::filter(MSA_manifest, chr %in% chr_vec[i])
+  matrix_sub <- GSE264438_beta_matrix[MSA_sub$IlmnID, ]
+  qs2::qs_save(matrix_sub, glue::glue("GSE264438/GSE264438_{chr_vec[i]}.qs2"))
+}
+
+qs2::qs_read("GSE264438/GSE264438_chrM.qs2")
+```
+
+

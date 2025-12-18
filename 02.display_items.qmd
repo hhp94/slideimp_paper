@@ -1,0 +1,876 @@
+---
+title: "Display Items"
+author: Hung
+date: "`r Sys.Date()`"
+format:
+  html:
+    fig-align: center
+    toc: true
+    toc-depth: 2
+    fig-height: 6
+    fig-width: 8
+    number-sections: false
+    toc-location: left
+    page-layout: full
+execute:  
+  echo: false  
+  warning: false
+  message: false
+---
+
+# Synopsis
+This file create the display items
+
+```{r}
+library(tidyverse)
+library(mirai)
+library(data.table)
+library(arrow)
+library(glue)
+library(gt)
+library(here)
+library(magick)
+library(qs2)
+library(duckdb)
+library(furrr)
+library(fst)
+library(gghalves)
+library(qs2)
+library(bench)
+library(patchwork)
+library(ggdist)
+library(ggtext)
+library(geomtextpath)
+source("utils.R")
+```
+
+# Flow Chart
+```{r, eval = F}
+"Methylation" <- "Data Type" -> "Other"
+"Microarray" <- "Methylation" -> "Whole Genome"
+"Whole Genome" -> "PCA or K-NN (sliding window)"
+"Microarray" -> "Can be meaningfully grouped (e.g., by chromosome or clusters)"
+
+"PCA or K-NN (ungrouped)" <- "No" <- "Can be meaningfully grouped (e.g., by chromosome or clusters)" -> "Yes" -> "PCA or K-NN (grouped)"
+
+"Other" -> "Dimensionality"
+"Can be meaningfully grouped (e.g., by chromosome or clusters)" <- "Low" <- "Dimensionality" -> "High" -> "Can be meaningfully sorted (e.g., by genomic position or by time"
+
+"Can be meaningfully grouped (e.g., by chromosome or clusters)" <- "Can be meaningfully sorted (e.g., by genomic position or by time" -> "Yes" -> "PCA or K-NN (sliding window)"
+```
+
+```{r, eval = F}
+library(DiagrammeR)
+library(DiagrammeRsvg)
+library(htmltools)
+
+dot_code <- ('
+digraph decision_tree {
+  graph [
+    layout = dot,
+    rankdir = TB,
+    splines = polyline,
+    nodesep = 0.05,
+    ranksep = 0.1,
+    bgcolor = "white",
+    pad = 0.1
+  ]
+
+  // Decision nodes
+  node [
+    shape = diamond,
+    style = "filled",
+    fillcolor = "#0d9488",
+    fontcolor = "white",
+    fontname = "Helvetica-Bold",
+    fontsize = 11,
+    penwidth = 0,
+    width = 0.8,
+    height = 0.4
+  ]
+  datatype [label = "Data Type"]
+  methtype [label = "Methylation\nData Type"]
+  group1 [label = "Groupable?\n(e.g., by Chr)"]
+  dim [label = "Dimensionality"]
+  sort [label = "Sortable?\n(e.g., by time)"]
+  group2 [label = "Groupable?\n(e.g., by Chr)"]
+
+  // Terminal nodes
+  node [
+    shape = box,
+    style = "filled,rounded",
+    fillcolor = "#f59e0b",
+    fontcolor = "white",
+    fontname = "Helvetica-Bold",
+    fontsize = 10,
+    penwidth = 0,
+    width = 1.35,
+    height = 0.5
+  ]
+  sliding1 [label = "PCA/K-NN\n(sliding window)"]
+  ungrouped1 [label = "PCA/K-NN\n(ungrouped)"]
+  grouped1 [label = "PCA/K-NN\n(grouped)"]
+  sliding2 [label = "PCA/K-NN\n(sliding window)"]
+  ungrouped2 [label = "PCA/K-NN\n(ungrouped)"]
+  grouped2 [label = "PCA/K-NN\n(grouped)"]
+
+  edge [
+    fontname = "Helvetica",
+    fontsize = 9,
+    penwidth = 1.5,
+    arrowsize = 0.5,
+    color = "#94a3b8",
+    fontcolor = "#1e293b"
+  ]
+
+  datatype -> methtype [label = "Methyl."]
+  datatype -> dim [label = "Other"]
+  methtype -> group1 [label = "Microarray"]
+  methtype -> sliding1 [label = "Whole\nGenome"]
+  group1 -> ungrouped1 [label = "No"]
+  group1 -> grouped1 [label = "Yes"]
+  dim -> group2 [label = "Low"]
+  dim -> sort [label = "High"]
+  sort -> group2 [label = "No"]
+  sort -> sliding2 [label = "Yes"]
+  group2 -> ungrouped2 [label = "No"]
+  group2 -> grouped2 [label = "Yes"]
+
+  {rank = same; methtype; dim}
+}
+')
+
+# graph <- grViz(dot_code, width = 350, height = 200)
+# graph <- grViz(dot_code, width = 400, height = 500)
+graph <- grViz(dot_code)
+svg_obj <- export_svg(graph)
+html_print(HTML(svg_obj))
+writeLines(svg_obj, "decision_tree.svg")
+```
+
+# Missing Data by Chip
+```{r}
+# rmiss <- read_fst(here("temp", "00.99.rmiss.fst")) |>
+#   as_tibble() |>
+#   rename("Platform" = "platform") |>
+#   # Remove CpGs that are completely masked
+#   subset(rmiss_perc < 1) |>
+#   mutate(
+#     Platform = fct_relevel(Platform, "EPICv1", "EPICv2", "MSA", "EM-seq")
+#   )
+```
+
+```{r}
+# as.data.table(rmiss)[, .N, by = Platform]
+```
+
+```{r}
+# rmiss_p <- rmiss |>
+#   ggplot(aes(x = rmiss_perc, color = Platform)) +
+#   stat_ecdf(geom = "step", pad = FALSE, linewidth = 0.75, alpha = 0.75) +
+#   scale_x_continuous(
+#     limits = c(0, 1), breaks = seq(0, 1, by = 0.1), labels = scales::percent
+#   ) +
+#   scale_y_continuous(
+#     limits = c(0, 1), breaks = seq(0, 1, 0.1), labels = scales::percent
+#   ) +
+#   scale_color_manual(values = RColorBrewer::brewer.pal(4, "Dark2")) +
+#   labs(
+#     tag = "A",
+#     title = "ECDF of Missing CpG Rates by Platform",
+#     x = "Missing CpGs Rate",
+#     y = "Cumulative Proportion of CpGs",
+#     color = "Platform"
+#   ) +
+#   theme(
+#     panel.grid.minor = element_blank(),
+#     plot.title = element_text(face = "bold"),
+#     strip.text = element_text(face = "bold"),
+#     legend.position = "bottom"
+#   ) +
+#   guides(color = guide_legend(override.aes = list(linewidth = 1.5)))
+```
+
+* Missing data is prevalent in methylation data. 
+  + EPIC platform is great but higher cost than MSA.
+  + MSA is much higher throughput, but missing data is a big problem. MSA designed for studying clocks
+  + Unbiased genome wide method like WGBS can't afford to sequence too deep due to cost, leading to high missing per CpGs.
+
+```{r}
+#| fig-height: 5
+#| fig-width: 10
+
+# rmiss_p
+```
+
+# Speed/Memory
+```{r}
+EPIC <- tibble(
+  platform = "EPIC",
+  n = c(500, 1000, 5000, 10000, 20000, 50000, 75000),
+  path = glue::glue("benchmark/{platform}_{n}.qs2")
+)
+
+EPIC$mark <- lapply(EPIC$path, qs2::qs_read)
+
+EPIC$path <- NULL
+
+clean_expression <- function(e) {
+  e <- as.character(e)
+  e <- case_when(
+    str_detect(e, "impute\\.knn") ~ "impute.knn",
+    str_detect(e, "methyLImp2") ~ "methyLImp2",
+    str_detect(e, "imputePCA") ~ "imputePCA",
+    str_detect(e, "pca") ~ "pca_imp",
+    str_detect(e, "brute.*cores") ~ "knn_imp (4)",
+    str_detect(e, "brute") ~ "knn_imp (1)",
+    str_detect(e, "kd") ~ "KDTree",
+    str_detect(e, "ball") ~ "Ball-tree"
+  )
+  e
+}
+```
+
+```{r}
+EPIC_speed <- unnest(EPIC, cols = mark) |>
+  mutate(expression = clean_expression(expression)) |>
+  select(n, expression, time, gc) |>
+  unnest(cols = c(time, gc)) |>
+  summarize(
+    lower = quantile(time, probs = 0.025),
+    median = quantile(time, probs = 0.5),
+    upper = quantile(time, probs = 0.975),
+    median_num = as.numeric(median),
+    .by = c(n, expression)
+  )
+
+expr_filter <- function(df) {
+  df |>
+    filter(!str_detect(expression, c("knn_imp \\(1\\)|KDTree"))) |>
+    mutate(
+      Package = if_else(str_detect(expression, "pca_|knn_|Ball"), "slideimp", "Others"),
+      expression = fct_relevel(
+        expression,
+        "methyLImp2",
+        "imputePCA",
+        "pca_imp",
+        "impute.knn",
+        "knn_imp (4)",
+        "Ball-tree"
+      )
+    )
+}
+
+# RColorBrewer::brewer.pal(7, "Dark2")
+
+dark2_6 <- c("#1B9E77", "#7570B3", "#D95F02", "#66A61E", "#E7298A", "#E6AB02")
+
+EPIC_speed_plot <- EPIC_speed |>
+  expr_filter() |>
+  ggplot(aes(x = n, y = median_num, color = expression)) +
+  geom_point(size = 1.25, alpha = 0.75) +
+  geom_line(aes(group = expression), alpha = 0.75) +
+  scale_y_log10(
+    breaks = c(0.001, 0.01, 0.1, 1, 10, 100, 1000),
+    labels = \(x) {
+      yc <- as.character(x)
+      if_else(yc == "1000", "1,000", yc)
+    }
+  ) +
+  labs(
+    tag = "B",
+    title = "Runtime Scaling by Imputation Methods",
+    x = "Number of CpGs",
+    y = expression("Median Runtime (s) "(log[10])),
+    color = NULL
+  ) +
+  scale_x_continuous(
+    breaks = c(500, 10000, 20000, 50000, 75000),
+    labels = scales::comma
+  ) +
+  scale_color_manual(values = dark2_6) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+```
+
+```{r}
+EPIC_memory <- unnest(EPIC, cols = mark) |>
+  mutate(expression = clean_expression(expression)) |>
+  filter(!is.na(mem_alloc)) |>
+  select(n, expression, mem_alloc) |>
+  expr_filter() |>
+  droplevels()
+
+EPIC_memory_plot <- EPIC_memory |>
+  ggplot(aes(x = n, y = mem_alloc, color = expression)) +
+  geom_point(size = 1.25, alpha = 0.75) +
+  geom_line(aes(group = expression), alpha = 0.75) +
+  labs(x = "Number of CpGs", y = "Memory Allocated", tag = "S1", color = NULL) +
+  scale_x_continuous(breaks = c(500, 1000, 5000)) +
+  scale_color_manual(values = dark2_6) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+```
+
+# Accuracy
+```{r}
+results <- tidyr::expand_grid(
+  package = c("knn_imp", "pca_imp", "methyLImp2"),
+  prefix = glue::glue("{package}_fitted_GSE286313_EPICv1_chr22"),
+  rate = c("0", "0.01", "0.025", "0.05")
+)
+
+results$package <- stringr::str_extract(results$prefix, "knn|methyLImp2|pca_imp")
+results$path <- with(results, glue::glue("benchmark/{prefix}.{rate}.fst"))
+results$exists <- file.exists(results$path)
+results$results <- lapply(results$path, fst::read_fst)
+results <- unnest(results, cols = results) |>
+  arrange(rate) |>
+  mutate(
+    .estimate = if_else(is.nan(.estimate), NA, .estimate),
+    extra_NA = forcats::fct_inorder(scales::percent(as.numeric(rate))),
+  )
+
+dark2_3 <- c("#E7298A", "#1B9E77", "#D95F02")
+
+EPIC_accuracy_plot <- results |>
+  filter(
+    package %in% c("knn", "pca_imp", "methyLImp2") & .metric %in% c("rmse", "rsq", "mae")
+  ) |>
+  mutate(
+    metric = case_match(.metric, "rmse" ~ "RMSE", "rsq" ~ "RSQ", "mae" ~ "MAE"),
+    package = case_match(package, "knn" ~ "knn_imp", .default = package)
+  ) |>
+  ggplot(aes(x = extra_NA, y = .estimate, color = package)) +
+  geom_boxplot(outlier.size = 0.5, outlier.alpha = 0.5) +
+  facet_wrap(~metric, scales = "free_y") +
+  labs(
+    title = "Accuracy of K-NN, PCA imputation vs. methyLImp2",
+    y = "Estimate",
+    x = "Extra global missing %",
+    color = NULL,
+    tag = "C"
+  ) +
+  scale_color_manual(values = dark2_3) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold"),
+    strip.text = element_text(face = "bold")
+  )
+```
+
+# Full MSA imputation
+```{r}
+library(yardstick)
+
+full_vs_group <- fst::read_fst("benchmark/full_vs_group.fst")
+
+full_vs_group$label <- with(
+  full_vs_group,
+  case_when(
+    method == "knn" & group == "full" ~ "K-NN",
+    method == "pca" & group == "full" ~ "PCA",
+    method == "knn" & group == "group" ~ "Group K-NN",
+    method == "pca" & group == "group" ~ "Group PCA"
+  )
+) |>
+  forcats::fct_relevel("K-NN", "Group K-NN", "PCA")
+```
+
+```{r}
+set.seed(1234)
+fvg_p <- full_vs_group |>
+  mutate(.metric = toupper(.metric)) |>
+  ggplot(aes(x = label, y = .estimate, color = label)) +
+  geom_half_boxplot(nudge = 0.15, outlier.shape = NA) +
+  geom_half_point(size = 1, alpha = 0.35, shape = 16, ) +
+  facet_wrap(~.metric, scales = "free_y") +
+  scale_color_manual(
+    values = c(
+      "K-NN" = "#2E86AB",
+      "Group K-NN" = "#6117d1",
+      "PCA" = "#F18F01",
+      "Group PCA" = "#C73E1D"
+    )
+  ) +
+  labs(
+    y = "Estimate",
+    color = NULL,
+    title = "PCA and K-NN imputation grouped by Chromosomes",
+    tag = "D"
+  ) +
+  theme(
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold"),
+    strip.text = element_text(face = "bold")
+  )
+```
+
+# MCAR/MAR/MNAR
+Split between treed and brute force methods
+```{r}
+method_lvl <- c(
+  "truth",
+  "mean",
+  "si_brute",
+  "si_tree",
+  "si_pca"
+)
+
+scenario_lvl <- c(
+  "truth",
+  "MCAR",
+  "MAR",
+  "MNAR"
+)
+
+analysis_table <- read_fst(
+  here::here("MCAR_MAR_MNAR", "03.analysis_table.fst"),
+  as.data.table = TRUE
+)[
+  method != "si_impute.knn"
+]
+
+analysis_table[
+  ,
+  let(
+    tree = grepl("tree", method),
+    mi = grepl("^mi", method)
+  )
+]
+
+truth_beta <- analysis_table[scenario == "truth" & estimand == "beta"]
+truth_se <- analysis_table[scenario == "truth" & estimand == "se"]
+
+analysis_table_sum <- analysis_table[
+  ,
+  list(
+    lower = quantile(estimate, probs = c(0.025)),
+    median = quantile(estimate, probs = c(0.5)),
+    upper = quantile(estimate, probs = c(0.975))
+  ),
+  by = c("pr", "method", "scenario", "estimand")
+][
+  ,
+  let(
+    tree = grepl("tree", method),
+    mi = grepl("^mi", method)
+  )
+][
+  ,
+  let(
+    method = fct_relevel(method, method_lvl),
+    scenario = fct_relevel(scenario, scenario_lvl),
+    pr_perc = scales::percent(pr),
+    pr = factor(pr)
+  )
+][
+  ,
+  method_label := fcase(
+    method == "truth", "Truth",
+    method == "mean", "Mean",
+    method == "si_brute", "knn_imp",
+    method == "si_tree", "Ball-tree",
+    method == "si_impute.knn", "impute.knn",
+    method == "si_pca", "pca_imp",
+    default = as.character(method)
+  )
+][
+  ,
+  method_label := fct_inorder(method_label)
+][]
+
+truth_sum <- melt(
+  analysis_table_sum[scenario == "truth"],
+  id.vars = "estimand",
+  measure.vars = c("lower", "median", "upper"),
+  variable.name = "quantile",
+  value.name = "value"
+)
+
+truth_sum[, co := fifelse(quantile == "median", "black", "grey50")]
+truth_sum[, quantile := forcats::fct_relevel(quantile, "upper", "median")]
+```
+
+```{r}
+simulation_plot <- function(estimand_type, tree_type, remove_mi = FALSE) {
+  filtered_data <- analysis_table_sum[
+    scenario != "truth" &
+      estimand == estimand_type &
+      (tree == tree_type | method %in% c("mean"))
+  ]
+
+  if (remove_mi) {
+    filtered_data <- filtered_data[!str_detect(method, "^mi"), ]
+  }
+
+  truth_data <- truth_sum[estimand == estimand_type]
+
+  p <- filtered_data |>
+    ggplot(aes(x = pr_perc, color = method_label)) +
+    geom_hline(
+      data = truth_data,
+      aes(yintercept = value, linetype = quantile)
+    ) +
+    facet_wrap(~scenario) +
+    geom_pointrange(
+      aes(ymin = lower, y = median, ymax = upper),
+      alpha = 0.75,
+      size = 0.15,
+      linewidth = 0.25,
+      position = position_dodge(width = 0.5)
+    ) +
+    scale_linetype_manual(values = c("dotted", "longdash", "dotted")) +
+    guides(
+      linetype = guide_legend(order = 1),
+      color = guide_legend(order = 2)
+    ) +
+    labs(
+      y = dplyr::if_else(estimand_type == "beta", "Beta", "Standard Error"),
+      x = "Per-CpG Missing Rate",
+      linetype = "Truth", color = "Method"
+    ) +
+    theme(panel.grid.minor = element_blank())
+
+  return(p)
+}
+```
+
+```{r}
+RColorBrewer::brewer.pal(7, "Dark2") |> dput()
+beta_brute_p <- simulation_plot("beta", FALSE, remove_mi = TRUE) +
+  labs(
+    tag = "S2",
+    title = "Simulations, Effect Size Estimates Coverage, PCA and K-NN imputation"
+  ) +
+  scale_color_manual(values = c("#1B9E77", "#E7298A", "#D95F02"))
+
+se_brute_p <- simulation_plot("se", FALSE, remove_mi = TRUE) +
+  labs(
+    tag = "S3",
+    title = "Simulations, Standard Error Estimates Coverage, PCA and K-NN imputation"
+  ) +
+  scale_color_manual(values = c("#1B9E77", "#E7298A", "#D95F02"))
+
+beta_tree_p <- simulation_plot("beta", TRUE, remove_mi = TRUE) +
+  labs(
+    tag = "S4",
+    title = "Simulations, Effect Size Estimates Coverage, Ball-tree K-NN imputation"
+  ) +
+  scale_color_manual(values = c("#1B9E77", "#A6761D"))
+
+se_tree_p <- simulation_plot("se", TRUE, remove_mi = TRUE) +
+  labs(
+    tag = "S5",
+    title = "Simulations, Standard Error Estimates Coverage, Ball-tree K-NN imputation"
+  ) +
+  scale_color_manual(values = c("#1B9E77", "#A6761D"))
+```
+
+# slideimp
+## Endometriosis
+```{r}
+clock_rmiss <- qs2::qs_read(here::here("data", "03.slide_imp.CpGs_wise_missing.qs2"))
+# clock_rmiss |>
+#   filter(clock == "PCClocks") |>
+#   unnest(miss) |>
+#   ggplot(aes(x = miss)) +
+#   geom_histogram()
+```
+
+```{r}
+library(lmtest)
+library(broom)
+library(ggtext)
+library(sandwich)
+
+epi_clocks_long <- read_csv(here::here("data", "03.01.epi_clocks_long.csv")) |>
+  mutate(batch = factor(batch))
+
+viz_df <- epi_clocks_long |>
+  filter(
+    name %in% c("Horvath1", "PCHorvath1")
+  ) |>
+  nest(.by = c("name", "method")) |>
+  mutate(
+    data = lapply(
+      data,
+      \(x) {
+        mutate(
+          x,
+          value_std = scale(value)[, 1],
+          age_std = scale(age)[, 1]
+        )
+      }
+    )
+  )
+
+viz_df$estimates <- lapply(
+  viz_df$data,
+  \(x) {
+    dplyr::filter(
+      broom::tidy(lm(value_std ~ age_std + batch, data = x)),
+      term == "age_std"
+    )
+  }
+)
+
+viz_df$labels <- sapply(
+  viz_df$estimates,
+  \(x) {
+    rho_val <- round(x$estimate, 3)
+    p_val <- if (x$p.value < 0.001) {
+      "< 0.001"
+    } else {
+      glue::glue(" ~ {round(x$p.value, 3)}")
+    }
+    glue("<i>r</i> ~ {rho_val}; <i>p</i> {p_val}")
+  }
+)
+
+viz_sum_df <- viz_df |>
+  select(name, method, data, labels) |>
+  unnest(cols = data) |>
+  mutate(
+    Method = forcats::fct_relevel(
+      case_match(method, "knn" ~ "Slide K-NN", "pca" ~ "Slide PCA", "raw" ~ "Baseline"),
+      "Slide K-NN", "Slide PCA"
+    )
+  )
+
+viz_sum_anno <- unique(select(viz_sum_df, Method, name, labels))
+
+endo_plot <- viz_sum_df |>
+  select(-labels) |>
+  ggplot(aes(x = age, y = value)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", color = "red", linewidth = 0.5) +
+  geom_richtext(
+    data = viz_sum_anno,
+    aes(label = labels),
+    x = -Inf,
+    y = Inf,
+    vjust = 1,
+    hjust = -0.05,
+    size = 1.5,
+    label.colour = NA,
+    fill = NA
+  ) +
+  labs(x = "Chronological Age (Years)", y = "Biological Age (Years)", tag = "S6") +
+  facet_grid(rows = vars(Method), cols = vars(name), scales = "free_y") +
+  theme_bw() +
+  theme(
+    strip.text = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+# Aggregation
+## Figure 1
+```{r, eval = F}
+library(ggtext)
+library(patchwork)
+
+theme_set(theme_bw())
+
+e_EPIC_speed_plot <- EPIC_speed_plot +
+  guides(
+    color = guide_legend(
+      position = "inside",
+      theme = theme(
+        legend.text = element_text(margin = margin(0, 0, 0, 0)),
+        legend.justification.inside = c(1, 0),
+        legend.background = element_blank(),
+        legend.key = element_blank(),
+        legend.key.spacing.y = unit(-2, "mm"),
+        legend.direction = "horizontal"
+      )
+    )
+  )
+
+e_EPIC_accuracy_plot <- EPIC_accuracy_plot +
+  guides(color = guide_legend(
+    position = "bottom",
+    theme = theme(
+      legend.text = element_text(margin = margin(0, 0, 0, 0)),
+      legend.background = element_blank(),
+      legend.key = element_blank()
+    )
+  )) +
+  theme(
+    legend.box.spacing = unit(1, "mm"),
+    legend.margin = margin(t = 0)
+  )
+
+e_fvg_p <- fvg_p +
+  guides(color = guide_legend(
+    position = "bottom",
+    theme = theme(
+      legend.text = element_text(margin = margin(0, 0, 0, 0)),
+      legend.background = element_blank(),
+      legend.key = element_blank()
+    )
+  )) +
+  theme(
+    legend.box.spacing = unit(1, "mm"),
+    legend.margin = margin(t = 0)
+  )
+
+figure <- list(
+  e_EPIC_speed_plot,
+  e_EPIC_accuracy_plot,
+  e_fvg_p
+)
+
+design <- ("
+##AA
+BBCC
+")
+
+theme_set(
+  theme_bw(base_size = 6, base_line_size = 0.25)
+)
+
+figure_1 <- wrap_plots(figure, design = design) &
+  theme(
+    plot.tag = element_text(face = "bold", size = 10),
+    axis.text = element_text(size = 4.5),
+    axis.title = element_text(size = 6),
+    legend.text = element_text(size = 4.5),
+    panel.grid.major = element_line(linewidth = 0.15)
+  )
+
+ggsave(
+  filename = "documents/figure/figures.svg",
+  plot = figure_1,
+  width = 7.5,
+  height = 5,
+  units = "in",
+  device = "svg"
+)
+
+abbreviations <- list(
+  Chr = "Chr: chromosome",
+  PCA = "PCA: principal component analysis",
+  KNN = "K-NN: k-nearest neighbors",
+  CpG = "CpG: cytosine–phosphate–guanine site",
+  MAE = "MAE: Mean Absolute Error",
+  RMSE = "RMSE: Root Mean Square Error",
+  RSQ = "RSQ: R-squared"
+)
+
+abbrv <- function(terms = NULL) {
+  if(is.null(terms)) {
+    paste0(unlist(abbreviations), collapse = '; ')
+  } else 
+  {
+    paste0(unlist(abbreviations[terms]), collapse = '; ')
+  }
+}
+
+figure_caption <- glue::glue("Figure 1. Overview of the slideimp package. (A) Decision tree for functions in slideimp: The package handles large DNA methylation data or other data types (e.g., microarrays or intensively sampled longitudinal data). Variables should be grouped before applying sliding window or normal imputation to reduce computational cost. slideimp also includes a helper function, tune_imp, to perform repeated cross-validation and measure the performance of K-NN vs. PCA, which aids in choosing the appropriate method. (B) Runtime benchmarks of different imputation methods: Points represent the median runtime measured in seconds. pca_imp (orange), knn_imp (4) (pink), and Ball-tree (yellow) represent the PCA, K-NN with 4 cores, and K-NN Ball-tree imputation implementations of slideimp, respectively. (C) Comparison of imputation accuracy between K-NN, PCA, and methyLImp2: With no added missingness (0.0%), all methods perform well for these data (GSE286313, EPICv1, N = 72, blood samples, chromosome 22), with PCA imputation having the lowest MAE and methyLImp2 having the lowest RMSE and highest RSQ. methyLImp2 accuracy decreases with increasing missingness. (D) Comparison of imputation accuracy between K-NN and PCA grouped by chromosome vs. ungrouped: PCA imputation is significantly more accurate than K-NN imputation using these data (GSE264438, MSA, N=581, diverse tissues). The grouped imputation is faster and more accurate for both methods. {abbrv()}.")
+```
+
+## Supplement
+```{r}
+theme_set(theme_bw())
+
+e_epic_memory_plot <- EPIC_memory_plot +
+  labs(
+    caption = glue::glue(
+      "Figure S1. Memory allocation benchmarks for different imputation methods. {abbrv('CpG')}."
+    )
+  ) +
+  theme(
+    plot.tag = element_text(face = "bold", size = 10),
+    axis.text = element_text(size = 4.5),
+    axis.title = element_text(size = 6),
+    legend.text = element_text(size = 4.5),
+    plot.caption = element_text(size = 4.5, hjust = 0),
+    panel.grid.major = element_line(linewidth = 0.15)
+  )
+
+monte_plots <- wrap_plots(
+  list(
+    beta_brute_p,
+    se_brute_p,
+    beta_tree_p,
+    se_tree_p
+  )
+) +
+  plot_annotation(
+    caption =
+      str_wrap(
+        glue::glue("Figure S2, S3, S4, S5. Results from 1000 Monte Carlo simulations of regression estimates under Missing Completely at Random (MCAR), Missing at Random (MAR), and Missing Not at Random (MNAR) mechanisms, across different per-CpG missing rates. The points represent the medians of the distributions. The lines represent the 95% quantile intervals of the distributions. The dotted and dashed lines represent the known true values. {abbrv(c('PCA', 'KNN', 'CpG'))}."),
+        width = 100
+      )
+  ) &
+  theme(
+    legend.position = "bottom",
+    legend.box.spacing = unit(1, "mm"),
+    legend.margin = margin(t = 0),
+    plot.tag = element_text(face = "bold", size = 10),
+    axis.text = element_text(size = 4.5),
+    axis.title = element_text(size = 6),
+    legend.text = element_text(size = 4.5),
+    plot.title = element_text(face = "bold"),
+    panel.grid.major = element_line(linewidth = 0.15),
+    strip.text = element_text(face = "bold", size = 6),
+    plot.caption = element_text(size = 4.5, hjust = 0)
+  )
+
+e_endo_plot <- endo_plot +
+  labs(caption = str_wrap(
+    glue::glue(
+      "Figure S6. Estimation of epigenetic clocks using imputed EM-seq data from 41 reproductive-age women with no pregnancy or malignancy. The Horvath 2013 clock estimates are in the left column. The PCHorvath1 clock estimates are in the right column. From top to bottom, the imputation methods are sliding window K-NN, sliding window PCA, and the baseline method. Correlation values and p-values are calculated after adjusting for the batch of the samples. {abbrv(c('KNN', 'PCA'))}."
+    ),
+    width = 100
+  )) +
+  theme(
+    plot.tag = element_text(face = "bold", size = 10),
+    axis.text = element_text(size = 4.5),
+    axis.title = element_text(size = 6),
+    legend.text = element_text(size = 4.5),
+    strip.text = element_text(face = "bold", size = 6),
+    plot.caption = element_text(size = 4.5, hjust = 0),
+    panel.grid.major = element_line(linewidth = 0.15)
+  )
+
+sup <- list(
+  memory = e_epic_memory_plot,
+  simulation = monte_plots,
+  endo = e_endo_plot
+)
+
+dimensions <- list(
+  memory = c(5, 4),
+  simulation = c(10, 8),
+  endo = c(6, 4)
+)
+
+theme_set(
+  theme_bw(base_size = 6, base_line_size = 0.25)
+)
+
+for (i in seq_along(sup)) {
+  ggsave(
+    filename = glue::glue("documents/supplements/{names(sup)[[i]]}.pdf"),
+    plot = sup[[i]],
+    width = dimensions[[i]][1],
+    height = dimensions[[i]][2],
+    units = "in",
+    device = "pdf"
+  )
+}
+
+# Set back to normal
+theme_set(theme_bw())
+```
+

@@ -1,0 +1,296 @@
+---
+title: "Meta Data"
+format: html
+editor: source
+---
+
+# Synopsis
+This file generate the meta data for all the data used in this experiment.
+
+# Raws
+Download the raw data.
+
+* Blood, Zhuang BC et al., 2025
+https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE286313
+
+* MSA, Goldberg DC et al., 2024
+https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE264438
+
+# Manifest
+* Manifest are stored under `data/manifest/(EPICv1, EPICv2, MSA)`
+```{r, eval = F}
+manifest_dir <- "data/manifest"
+
+if (!dir.exists(manifest_dir)) {
+  dir.create(manifest_dir, recursive = TRUE)
+}
+
+manifest <- tibble::tibble(
+  chip = c("EPICv1", "EPICv2", "MSA"),
+  link = c(
+    "https://webdata.illumina.com/downloads/productfiles/methylationEPIC/infinium-methylationepic-v-1-0-b5-manifest-file-csv.zip",
+    "https://support.illumina.com/content/dam/illumina-support/documents/downloads/productfiles/methylationepic/InfiniumMethylationEPICv2.0ProductFiles(ZIPFormat).zip",
+    "https://support.illumina.com/content/dam/illumina-support/documents/downloads/productfiles/infiniummethylationscreening/MSA-48v1-0_20102838_A1.csv"
+  ),
+  out_dir = glue::glue("{manifest_dir}/{chip}"),
+  filename = basename(link)
+)
+
+for (i in seq_len(nrow(manifest))) {
+  dir_path <- manifest$out_dir[i]
+  file_path <- file.path(dir_path, manifest$filename[i])
+
+  if (!file.exists(file_path)) {
+    if (!dir.exists(dir_path)) {
+      dir.create(dir_path, recursive = TRUE)
+    }
+    system(glue("curl -O --output-dir {dir_path} {manifest$link[i]}"))
+  }
+}
+
+# unzip EPIC and EPICv2
+unzip(
+  zipfile = glue::glue("{manifest$out_dir[1]}/{manifest$filename[1]}"),
+  files = "infinium-methylationepic-v-1-0-b5-manifest-file.csv",
+  exdir = manifest$out_dir[1]
+)
+
+unzip(
+  zipfile = glue::glue("{manifest$out_dir[2]}/{manifest$filename[2]}"),
+  files = "MethylationEPIC v2.0 Files/EPIC-8v2-0_A2.csv",
+  exdir = manifest$out_dir[2]
+)
+
+file.copy(
+  glue::glue("{manifest$out_dir[2]}/MethylationEPIC v2.0 Files/EPIC-8v2-0_A2.csv"),
+  manifest$out_dir[2]
+)
+
+unlink(
+  glue::glue("{manifest$out_dir[2]}/MethylationEPIC v2.0 Files/EPIC-8v2-0_A2.csv")
+)
+```
+
+```{r, eval = F}
+manifest$raw_manifest <- c(
+  glue::glue("{manifest$out_dir[1]}/infinium-methylationepic-v-1-0-b5-manifest-file.csv"),
+  glue::glue("{manifest$out_dir[2]}/EPIC-8v2-0_A2.csv"),
+  glue::glue("{manifest$out_dir[3]}/MSA-48v1-0_20102838_A1.csv")
+)
+
+stopifnot(all(file.exists(manifest$raw_manifest)))
+
+manifest$header <- lapply(
+  manifest$raw_manifest,
+  \(x) readr::read_lines(x, n_max = 9)
+)
+
+# Using header, we manually define which rows to read
+manifest$header
+manifest$skip <- c(7, 7, 7)
+manifest$to <- c(865918, 937055, 281806)
+
+# purrr::map2(
+#   manifest$raw_manifest,
+#   manifest$skip + manifest$to,
+#   \(x, y) {
+#     readr::read_lines(x, skip = y, n_max = 5)
+#   }
+# )
+
+manifest$top <- purrr::map2(
+  manifest$raw_manifest,
+  manifest$skip,
+  \(x, y) {
+    fread(x, skip = y, nrow = 5)
+  }
+)
+
+manifest$manifest <- purrr::pmap(
+  .l = list(
+    ra = manifest$raw_manifest,
+    sk = manifest$skip,
+    to = manifest$to
+  ),
+  .f = function(ra, sk, to) {
+    fread(
+      ra,
+      skip = sk,
+      nrows = to,
+      select = c("IlmnID", "Name", "Genome_Build", "CHR", "MAPINFO")
+    )[order(CHR, MAPINFO)]
+  }
+)
+
+manifest$manifest <- purrr::map(
+  manifest$manifest,
+  \(x) {
+    copy(x)[!is.na(MAPINFO), ]
+  }
+)
+
+manifest$out <- glue::glue(
+  "./data/manifest/{manifest$chip}/{manifest$chip}_clean.pq"
+)
+
+purrr::walk2(
+  manifest$manifest,
+  manifest$out,
+  \(x, y) {
+    write_parquet(unique(x), y)
+  }
+)
+```
+
+# Metadata
+```{r, eval = TRUE}
+library(duckdb)
+library(qs2)
+library(arrow)
+library(glue)
+library(tidyverse)
+
+# Generate metadata
+GSE_meta <- tibble::tibble(
+  GSE = c("GSE286313", "GSE286313", "GSE264438"),
+  platform = c("EPICv1", "EPICv2", "MSA"),
+  description = c(
+    "EPICv1 data from matched blood samples across four cohorts spanning early to late adulthood",
+    "EPICv2 data from matched blood samples across four cohorts spanning early to late adulthood",
+    "Methylation Screening Array (MSA) data from human cell lines of across various tissues"
+  )
+)
+
+get_manifest <- function(platform = c("EPICv1", "EPICv2", "MSA"), root = here::here()) {
+  platform <- unique(match.arg(platform, several.ok = TRUE))
+  path <- glue::glue("{root}/data/manifest/{platform}/{platform}_clean.pq")
+  stopifnot(all(file.exists(path)))
+  return(as.character(path))
+}
+
+get_DNAm <- function(platform = NULL, chr = NULL, root = here::here()) {
+  if (is.null(platform)) {
+    message("Available platforms:")
+    print(GSE_meta)
+    return(invisible(NULL))
+  }
+  if (!platform %in% GSE_meta$platform) {
+    message("Available platforms:")
+    print(GSE_meta)
+    return(invisible(NULL))
+  }
+
+  raw <- if (platform == "EPICv1") {
+    file.path(root, "GSE286313", "EPICv1")
+  } else if (platform == "EPICv2") {
+    file.path(root, "GSE286313", "EPICv2")
+  } else if (platform == "MSA") {
+    file.path(root, "GSE264438")
+  } else {
+    stop("platform must be either 'EPICv1', 'EPICv2', or 'MSA'")
+  }
+  if (!dir.exists(raw)) {
+    stop("Directory not found: ", raw)
+  }
+  all_files <- list.files(raw, full.names = FALSE)
+
+  if (is.null(chr)) {
+    message("Available chromosomes:")
+    chr_pattern <- "chr[0-9XYM]+"
+    chr_matches <- stringr::str_extract(all_files, chr_pattern)
+    available_chrs <- unique(na.omit(chr_matches))
+    if (length(available_chrs) > 0) {
+      print(sort(available_chrs))
+      message("Use chr = 'all' to get all chromosomes")
+    } else {
+      message("No chromosome-based files found. All files:")
+      print(all_files)
+    }
+    return(invisible(NULL))
+  }
+
+  if (length(chr) == 1 && tolower(chr) == "all") {
+    chr_pattern <- "_chr[0-9XYM]+\\."
+    chr_files <- all_files[stringr::str_detect(all_files, chr_pattern)]
+    if (length(chr_files) == 0) {
+      message("No chromosome-split files found in ", raw)
+      return(tibble::tibble(file = character(0), path = character(0)))
+    }
+    return(tibble::tibble(
+      file = chr_files,
+      path = file.path(raw, chr_files)
+    ))
+  }
+
+  # Handle specific chr(s)
+  chr <- as.character(chr)
+  chr <- ifelse(stringr::str_detect(chr, "^chr"), chr, paste0("chr", chr))
+  patterns <- paste0("_", chr, "\\.")
+  combined_pattern <- paste(patterns, collapse = "|")
+  matching_files <- all_files[stringr::str_detect(all_files, combined_pattern)]
+  if (length(matching_files) == 0) {
+    message("No files matching chr(s) ", paste(chr, collapse = ", "), " in ", raw)
+    return(tibble::tibble(file = character(0), path = character(0)))
+  }
+  return(tibble::tibble(
+    file = matching_files,
+    path = file.path(raw, matching_files)
+  ))
+}
+
+drv <- duckdb()
+con <- dbConnect(drv)
+```
+
+# Statistics
+We need N samples, N probes, Global Miss, and N CpG miss for all platforms
+
+## Illumina Arrays
+```{r, eval = F}
+n_samples <- GSE_meta
+
+n_samples$probes_info <- map(
+  n_samples$platform,
+  \(x) {
+    meta <- get_DNAm(x, "all")
+    meta$files <- map(meta$path, \(y) qs2::qs_read(y))
+    meta$nrow <- map_dbl(meta$files, \(y) nrow(y))
+    meta$miss <- map(meta$files, \(y) rowSums(is.na(y)))
+    tibble::tibble(
+      n_samples = ncol(meta$files[[1]]),
+      n_probes = sum(meta$nrow),
+      rmiss = list(list_c(meta$miss))
+    )
+  }
+)
+
+n_samples$n_samples <- map_dbl(n_samples$probes_info, \(x) x$n_samples)
+n_samples$n_probes <- map_dbl(n_samples$probes_info, \(x) x$n_probes)
+```
+
+```{r, eval = F}
+metadata <- select(n_samples, -probes_info)
+write_csv(metadata, here::here("data", "metadata.csv"))
+```
+
+## rmiss
+```{r}
+illumina_rmiss <- select(n_samples, platform, probes_info) |>
+  unnest(cols = probes_info) |>
+  select(-c(n_probes)) |>
+  unnest(cols = rmiss) |>
+  mutate(rmiss_perc = rmiss / n_samples)
+
+emseq_rmiss <- fst::read_fst(
+  here::here("data", "25_09_10.EMseq_rmiss_results.fst")
+)
+emseq_rmiss$GSE <- NULL
+emseq_rmiss$platform <- "EM-seq"
+
+rmiss <- bind_rows(
+  select(illumina_rmiss, platform, rmiss_perc),
+  emseq_rmiss
+)
+
+fst::write_fst(rmiss, here::here("temp", "00.99.rmiss.fst"), compress = 100)
+```
