@@ -59,91 +59,6 @@ source("utils.R")
 ```
 
 # Speed/Memory
-Perform imputation on just 1000 CpGs of chr22 of MSA chip
-```{r}
-library(missRanger)
-
-MSA_chr22 <- t(qs_read(get_DNAm("MSA", glue::glue("chr{22}"))$path)[1:1000, ])
-MSA_chr22_miss <- is.na(MSA_chr22)
-MSA_chr22 <- MSA_chr22[, colSums(MSA_chr22_miss) / nrow(MSA_chr22_miss) < 0.9]
-sum(MSA_chr22_miss) * 100 / length(MSA_chr22_miss)
-
-set.seed(1234)
-if (!file.exists("benchmark/rf_bench.rds")) {
-  rf_bench <- bench::mark(
-    missRanger(
-      as.data.frame(MSA_chr22),
-      num.threads = 6,
-      data_only = TRUE
-    ),
-    knn_imp(MSA_chr22, k = 20, cores = 6, weighted = TRUE, dist_pow = 1),
-    check = F
-  )
-  rf_bench$memory <- NULL
-  saveRDS(rf_bench, "benchmark/rf_bench.rds")
-} else {
-  rf_bench <- readRDS("benchmark/rf_bench.rds")
-}
-
-if (!file.exists("benchmark/rf_imp.rds")) {
-  rf_fns <- function(obj, ...) {
-    r <- missRanger(as.data.frame(obj), num.threads = 6, data_only = TRUE)
-    as.matrix(r)
-  }
-
-  set.seed(1234)
-  rf_imp <- tune_imp(
-    MSA_chr22,
-    .f = rf_fns,
-    parameters = data.frame(r = 1),
-    rep = 5,
-    num_na = 6000
-  )
-
-  set.seed(1234)
-  knn_imp_res <- tune_imp(
-    MSA_chr22,
-    .f = "knn_imp",
-    parameters = data.frame(k = 20, weighted = TRUE, dist_pow = 3),
-    rep = 5,
-    cores = 6,
-    num_na = 6000
-  )
-
-  saveRDS(rf_imp, "benchmark/rf_imp.rds")
-  saveRDS(knn_imp_res, "benchmark/knn_imp_res.rds")
-} else {
-  rf_imp <- readRDS("benchmark/rf_imp.rds")
-  knn_imp_res <- readRDS("benchmark/knn_imp_res.rds")
-}
-
-met_set <- yardstick::metric_set(yardstick::mae, yardstick::rmse, yardstick::rsq)
-
-rf_imp$results <- lapply(
-  rf_imp$result,
-  \(x) {
-    met_set(x, truth = truth, estimate = estimate)
-  }
-)
-
-knn_imp_res$results <- lapply(
-  knn_imp_res$result,
-  \(x) {
-    met_set(x, truth = truth, estimate = estimate)
-  }
-)
-
-knn_imp_res <- unnest(knn_imp_res, cols = "results")
-subset(knn_imp_res) |>
-  summarize(mean = mean(.estimate), .by = ".metric")
-
-rf_imp <- unnest(rf_imp, cols = "results")
-subset(rf_imp) |>
-  summarize(mean = mean(.estimate), .by = ".metric")
-
-rf_bench
-```
-
 ```{r, eval = F}
 EPIC_chr1 <- do.call(rbind, lapply(get_DNAm("EPICv1", c("chr1"))$path, qs_read))
 EPIC_chr1_miss <- is.na(EPIC_chr1)
@@ -335,11 +250,11 @@ EPIC_10000 <- mark(
   f_knn_kd(EPIC_chr1_t, 10000, cores = 4),
   f_knn_ball(EPIC_chr1_t, 10000, cores = 4),
   min_iterations = 5,
-  memory = FALSE,
   check = F,
   filter_gc = FALSE
 )
 
+# Skip memory for below tests due to size
 EPIC_20000 <- mark(
   f_impute.knn(EPIC_chr1, 20000),
   f_methyLImp2(EPIC_chr1_t, 20000),
@@ -350,7 +265,7 @@ EPIC_20000 <- mark(
   f_knn_kd(EPIC_chr1_t, 20000, cores = 4),
   f_knn_ball(EPIC_chr1_t, 20000, cores = 4),
   min_iterations = 5,
-  memory = FALSE,
+  # memory = FALSE,
   check = F,
   filter_gc = FALSE
 )
@@ -365,7 +280,7 @@ EPIC_50000 <- mark(
   f_knn_kd(EPIC_chr1_t, 50000, cores = 4),
   f_knn_ball(EPIC_chr1_t, 50000, cores = 4),
   min_iterations = 5,
-  memory = FALSE,
+  # memory = FALSE,
   check = F,
   filter_gc = FALSE
 )

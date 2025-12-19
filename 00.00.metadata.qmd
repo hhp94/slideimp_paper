@@ -19,6 +19,8 @@ https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE264438
 # Manifest
 * Manifest are stored under `data/manifest/(EPICv1, EPICv2, MSA)`
 ```{r, eval = F}
+library(glue)
+
 manifest_dir <- "data/manifest"
 
 if (!dir.exists(manifest_dir)) {
@@ -72,6 +74,9 @@ unlink(
 ```
 
 ```{r, eval = F}
+library(data.table)
+library(arrow)
+
 manifest$raw_manifest <- c(
   glue::glue("{manifest$out_dir[1]}/infinium-methylationepic-v-1-0-b5-manifest-file.csv"),
   glue::glue("{manifest$out_dir[2]}/EPIC-8v2-0_A2.csv"),
@@ -269,12 +274,15 @@ n_samples$n_probes <- map_dbl(n_samples$probes_info, \(x) x$n_probes)
 ```
 
 ```{r, eval = F}
+library(dplyr)
+library(readr)
+
 metadata <- select(n_samples, -probes_info)
 write_csv(metadata, here::here("data", "metadata.csv"))
 ```
 
 ## rmiss
-```{r}
+```{r, eval = F}
 illumina_rmiss <- select(n_samples, platform, probes_info) |>
   unnest(cols = probes_info) |>
   select(-c(n_probes)) |>
