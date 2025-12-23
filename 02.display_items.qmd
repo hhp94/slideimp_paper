@@ -207,7 +207,7 @@ writeLines(svg_obj, "decision_tree.svg")
 ```{r}
 EPIC <- tibble(
   platform = "EPIC",
-  n = c(500, 1000, 5000, 10000, 20000, 50000, 75000),
+  n = c(500, 1000, 5000, 10000, 20000, 50000, 72000),
   path = glue::glue("benchmark/{platform}_{n}.qs2")
 )
 
@@ -285,7 +285,7 @@ EPIC_speed_plot <- EPIC_speed |>
     color = NULL
   ) +
   scale_x_continuous(
-    breaks = c(500, 10000, 20000, 50000, 75000),
+    breaks = c(500, 10000, 20000, 50000, 72000),
     labels = scales::comma
   ) +
   scale_color_manual(values = dark2_6) +
@@ -767,11 +767,10 @@ abbreviations <- list(
 )
 
 abbrv <- function(terms = NULL) {
-  if(is.null(terms)) {
-    paste0(unlist(abbreviations), collapse = '; ')
-  } else 
-  {
-    paste0(unlist(abbreviations[terms]), collapse = '; ')
+  if (is.null(terms)) {
+    paste0(unlist(abbreviations), collapse = "; ")
+  } else {
+    paste0(unlist(abbreviations[terms]), collapse = "; ")
   }
 }
 
