@@ -287,7 +287,9 @@ walk2(
     qs2::qs_save(x, y)
   }
 )
+```
 
+```{r, eval = F}
 dir_path <- "benchmark/gnu_time"
 
 if (!dir.exists(dir_path)) {
@@ -398,18 +400,6 @@ if (!argv$baseline) {
 }
 ```
 
-```{bash, eval = F}
-#!/bin/bash
-
-for i in {1..5}; do
-  for j in 1 4; do
-    /usr/bin/time -f "%U\t%S\t%e\t%P\t%M" -o output/baseline-10000-${i}-${j}.txt apptainer exec $APPTAINER/missRanger/missRanger.sif Rscript memory.R --rds input/functions.rds --chr1 input/EPIC_chr1_t.rds --fun_name f_knn_brute --baseline --cpgs 10000 --cores ${j}
-  done
-done
-
-srun --partition=day --cpus-per-task=4 --mem=30GB --time=5:00
-```
-
 ```{r}
 library(tidyverse)
 
@@ -429,15 +419,14 @@ other_params <- tidyr::expand_grid(
 )
 
 all_jobs <- bind_rows(knn_params, other_params)
-all_jobs$output <- with(all_jobs, glue::glue('output/{f}-{cpgs}-{cores}-{rep}'))
+all_jobs$output <- with(all_jobs, glue::glue("output/{f}-{cpgs}-{cores}-{rep}"))
 all_jobs$job <- with(all_jobs, glue::glue(
   '/usr/bin/time -f "%U\\t%S\\t%e\\t%P\\t%M" -o {output}.txt',
   "apptainer exec $APPTAINER/missRanger/missRanger.sif Rscript memory.R",
   "--rds input/functions.rds --chr1 input/EPIC_chr1_t.rds",
   "--fun_name {f} --cpgs {cpgs} --cores {cores}",
   .sep = " "
-  )
-)
+))
 
 # /usr/bin/time -f "%U\t%S\t%e\t%P\t%M" -o {output} {command}
 # %U - User CPU time (seconds)
@@ -446,7 +435,7 @@ all_jobs$job <- with(all_jobs, glue::glue(
 # %P - CPU percentage
 # %M - Maximum resident set size (KB)
 
-splitIndices1 <- function (nx, ncl) {
+splitIndices1 <- function(nx, ncl) {
   nx <- as.integer(nx)
   ncl <- as.integer(ncl)
   stopifnot(`nx and ncl must be non negative` = nx > 0 & ncl > 0)
@@ -458,7 +447,7 @@ splitIndices1 <- function (nx, ncl) {
 }
 
 jobs <- splitIndices1(length(all_jobs$job), 28)
-jobs_list <- lapply(jobs, \(x) paste(all_jobs$job[x], collapse = "; ")) |> 
+jobs_list <- lapply(jobs, \(x) paste(all_jobs$job[x], collapse = "; ")) |>
   purrr::list_c()
 
 readr::write_lines(jobs_list, "benchmark/gnu_time/joblist.txt")
@@ -477,6 +466,56 @@ dsq_gen(
 )
 
 # dsq --job-file joblist.txt --batch-file memory_profile.sh --job-name memory_profile --max-jobs 14 --output dSQ/dsq-jobfile-%A_%a-%N.out --status-dir . --time 01:00:00 --nodes 1 --ntasks-per-node 1 --cpus-per-task 4 --mem 40G --partition day
+```
+
+## Viz
+```{r}
+library(tidyverse)
+
+if (!file.exists("benchmark/gnu_time/memory.csv")) {
+  memory <- tibble(
+    files = list.files("benchmark/gnu_time/output"),
+    paths = list.files("benchmark/gnu_time/output", full.names = TRUE)
+  ) |>
+    separate_wider_delim(files, names = c("type", "cpgs", "cores", "rep"), delim = "-") |>
+    filter(type != "baseline") |>
+    mutate(
+      cpgs = as.numeric(cpgs),
+      cores = as.numeric(cores),
+      rep = as.numeric(str_remove(rep, ".txt")),
+      files = lapply(paths, \(x) suppressMessages(read_tsv(x, col_names = FALSE))),
+      paths = NULL
+    ) |>
+    unnest(cols = files)
+
+  names(memory)[match(paste0("X", 1:5), names(memory))] <- c(
+    "user_cpu",
+    "system_cpu",
+    "elapsed_real_time",
+    "cpu_useage",
+    "max_resident_set_size_kb"
+  )
+
+  memory$cpu_useage <- as.numeric(str_remove(memory$cpu_useage, "%"))
+  write_csv(memory, "benchmark/gnu_time/memory.csv")
+} else {
+  memory <- read_csv("benchmark/gnu_time/memory.csv")
+}
+
+viz_df <- filter(memory, type != "baseline") |>
+  pivot_longer(
+    cols = c(user_cpu, system_cpu, elapsed_real_time, cpu_useage, max_resident_set_size_kb)
+  ) |>
+  mutate(type = if_else(cores != 1, glue::glue("{type}_{cores}"), type)) |>
+  summarize(median_value = median(value), .by = c("type", "cpgs", "cores", "name"))
+
+viz_df |>
+  filter(name == "max_resident_set_size_kb", type != "f_knn_brute") |>
+  mutate(median_value = median_value * 1024) |>
+  ggplot(aes(x = cpgs, y = median_value)) +
+  geom_point(alpha = 0.75, aes(color = type), size = 2) +
+  geom_line(aes(group = type, color = type)) +
+  scale_y_continuous(labels = scales::label_bytes())
 ```
 
 # Accuracy
