@@ -55,7 +55,7 @@ qs2::qs_save(GSE264438_beta_matrix, "GSE264438/GSE264438_beta_matrix.qs2")
 
 ```{r}
 GSE264438_beta_matrix <- qs2::qs_read("GSE264438/GSE264438_beta_matrix.qs2")
-MSA_manifest <- as_tibble(arrow::read_parquet(get_manifest("MSA")))
+MSA_manifest <- as_tibble(arrow::read_parquet(get_manifest_obj("MSA")))
 MSA_manifest$chr <- paste0("chr", MSA_manifest$CHR)
 chr_vec <- unique(MSA_manifest$chr)
 

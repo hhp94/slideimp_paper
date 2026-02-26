@@ -166,7 +166,7 @@ GSE_meta <- tibble::tibble(
   )
 )
 
-get_manifest <- function(platform = c("EPICv1", "EPICv2", "MSA"), root = here::here()) {
+get_manifest_obj <- function(platform = c("EPICv1", "EPICv2", "MSA"), root = here::here()) {
   platform <- unique(match.arg(platform, several.ok = TRUE))
   path <- glue::glue("{root}/data/manifest/{platform}/{platform}_clean.pq")
   stopifnot(all(file.exists(path)))

@@ -140,7 +140,7 @@ for (i in unique(metadata$platform)) {
   if (!dir.exists(root)) {
     dir.create(root)
   }
-  manifest <- arrow::read_parquet(get_manifest(platform = i))
+  manifest <- arrow::read_parquet(get_manifest_obj(platform = i))
   beta_matrix <- qs2::qs_read(
     file.path("GSE286313", paste0("GSE286313", ".", i, ".qs2"))
   )

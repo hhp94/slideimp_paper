@@ -28,7 +28,7 @@ This file performs the benchmarks
 pkgs <- list(
   cran = c("missMDA", "softImpute", "missRanger"),
   bioc = c("methyLImp2", "impute"),
-  github = c("hhp94/slideimp")
+  github = c("hhp94/slideimp", "hhp94/slideimp.extra")
 )
 
 if (!rlang::is_installed("BiocManager")) install.packages("BiocManager")
@@ -316,7 +316,7 @@ saveRDS(
 ```
 
 # Memory
-The bench::mark tool may not be measuring memory profile of underlying R codes accurately. So we profile peak memory usage using gnu time. The HPC has different nodes but peak memory useage should be the same across all of them.
+The `bench::mark` tool may not be measuring memory profile of underlying R codes accurately. So we profile peak memory usage using gnu time. The HPC has different nodes but peak memory useage should be the same across all of them.
 
 ```{r memory.R, eval =  F}
 library(argparser)
@@ -325,7 +325,7 @@ p <- arg_parser("memory profile")
 p <- add_argument(
   p,
   "--rds",
-  help = "rds file containing the functinos",
+  help = "rds file containing the functions",
   type = "character"
 )
 p <- add_argument(p, "--chr1", help = "chr1 data", type = "character")
@@ -516,6 +516,40 @@ viz_df |>
   geom_point(alpha = 0.75, aes(color = type), size = 2) +
   geom_line(aes(group = type, color = type)) +
   scale_y_continuous(labels = scales::label_bytes())
+```
+
+# Multi Cores
+* R2 requests that the benchmark done on multiple cores. We perform grouped imputation on the first 8 chromosomes of the EPICv2 GSE286313 data using 4/8 cores (1/2 iterations) in parallel.
+* Scenarios will be K-NN, pca_imp, methyLImp2 PSOCK, and methyLImp2 FORK.
+* We will also have to pin the jobs to a specific node for maximum reproducibility.
+
+## Prep
+```{r}
+beta_matrix <- do.call(
+  rbind,
+  lapply(
+    get_DNAm(
+      "EPICv2",
+      c(glue::glue("chr{1:8}"))
+      # c(glue::glue("all"))
+    )$path, 
+    qs_read
+  )
+) |>
+  t()
+
+# beta_matrix <- dedup_matrix(beta_matrix, "EPICv2")
+cv <- col_vars(beta_matrix)
+
+beta_matrix <- beta_matrix[, !is.na(cv) & cv > 0]
+beta_matrix |> dim()
+
+EPICv2 <- subset(ilmn_manifest("EPICv2", dedupped = FALSE), group != "0")
+
+group_df <- group_features(beta_matrix, EPICv2)
+
+qs2::qs_save(beta_matrix, here("GSE286313", "GSE286313.EPICv2.chr1-8.qs2"))
+qs2::qs_save(group_df, here("GSE286313", "GSE286313.EPICv2.chr1-8.group_df.qs2"))
 ```
 
 # Accuracy
@@ -953,7 +987,7 @@ MSA <- MSA[, !(is.na(cv) & dplyr::near(cv, 0))]
 dim(MSA)
 
 # Get manifest. Needed for `group_imp`
-MSA_manifest <- arrow::read_parquet(get_manifest("MSA"))
+MSA_manifest <- arrow::read_parquet(get_manifest_obj("MSA"))
 all_probes <- intersect(colnames(MSA), MSA_manifest$IlmnID)
 
 # Align

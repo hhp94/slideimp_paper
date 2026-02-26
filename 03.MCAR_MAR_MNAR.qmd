@@ -56,7 +56,7 @@ query <- dbGetQuery(
     ON h.Name = m.Name
     ",
     .con = con,
-    mani = get_manifest("EPICv2")
+    mani = get_manifest_obj("EPICv2")
   )
 ) |>
   inner_join(
