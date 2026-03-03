@@ -148,6 +148,11 @@ html_print(HTML(svg_obj))
 writeLines(svg_obj, "decision_tree.svg")
 ```
 
+# Illustration
+```{r}
+
+```
+
 # Missing Data by Chip
 ```{r}
 # rmiss <- read_fst(here("temp", "00.99.rmiss.fst")) |>
@@ -316,6 +321,51 @@ EPIC_memory_plot <- EPIC_memory |>
   )
 ```
 
+# Multi Cores
+Summarize by median since the spread is really minimal. Remove `impute.knn` because the results are not comparable. Remove `knn_tree` because this method would only benefit at much higher dimension.
+
+```{r}
+library(gghalves)
+library(ggrepel)
+
+multi_cores_output <- readRDS(
+  here::here("benchmark", "multi_cores", "multi_cores_output.rds")
+) |>
+  summarize(
+    median_elapsed = median(Elapsed),
+    median_total_cpu = median(TotalCPU),
+    median_max_rss_bytes = median(max_rss_bytes),
+    .by = c("cores", "method")
+  ) |>
+  mutate(
+    method_label = replace_values(
+      method,
+      "knn" ~ "K-NN",
+      "methyLImp2_fork" ~ "methyLImp2 (FORK)",
+      "methyLImp2_psock" ~ "methyLImp2",
+      "pca" ~ "PCA",
+      "knn_tree" ~ "K-NN Ball-tree"
+    ),
+    median_max_rss_gb = median_max_rss_bytes / 1024^3
+  ) |>
+  arrange(cores, method)
+
+multi_cores_output |>
+  filter(!method %in% c("impute.knn", "methyLImp2_fork")) |>
+  ggplot(aes(x = cores, y = as.numeric(median_elapsed), color = method_label)) +
+  geom_point() +
+  scale_y_log10() +
+  geom_text_repel(aes(label = as.numeric(median_elapsed))) +
+  geom_line(aes(group = method))
+
+multi_cores_output |>
+  filter(!method %in% c("impute.knn", "methyLImp2_fork", "knn_tree")) |>
+  ggplot(aes(x = cores, y = median_max_rss_gb, color = method_label)) +
+  geom_point() +
+  # geom_text_repel(aes(label = median_max_rss_gb)) +
+  geom_line(aes(group = method))
+```
+
 # Accuracy
 ```{r}
 results <- tidyr::expand_grid(
@@ -325,7 +375,7 @@ results <- tidyr::expand_grid(
 )
 
 results$package <- stringr::str_extract(results$prefix, "knn|methyLImp2|pca_imp")
-results$path <- with(results, glue::glue("benchmark/{prefix}.{rate}.fst"))
+results$path <- with(results, glue::glue("benchmark/accuracy/{prefix}.{rate}.fst"))
 results$exists <- file.exists(results$path)
 results$results <- lapply(results$path, fst::read_fst)
 results <- unnest(results, cols = results) |>
@@ -342,8 +392,8 @@ EPIC_accuracy_plot <- results |>
     package %in% c("knn", "pca_imp", "methyLImp2") & .metric %in% c("rmse", "rsq", "mae")
   ) |>
   mutate(
-    metric = case_match(.metric, "rmse" ~ "RMSE", "rsq" ~ "RSQ", "mae" ~ "MAE"),
-    package = case_match(package, "knn" ~ "knn_imp", .default = package)
+    metric = recode_values(.metric, "rmse" ~ "RMSE", "rsq" ~ "RSQ", "mae" ~ "MAE"),
+    package = recode_values(package, "knn" ~ "knn_imp", default = package)
   ) |>
   ggplot(aes(x = extra_NA, y = .estimate, color = package)) +
   geom_boxplot(outlier.size = 0.5, outlier.alpha = 0.5) +
@@ -365,9 +415,8 @@ EPIC_accuracy_plot <- results |>
 
 # Full MSA imputation
 ```{r}
-library(yardstick)
-
-full_vs_group <- fst::read_fst("benchmark/full_vs_group.fst")
+full_vs_group <- fst::read_fst("benchmark/full_vs_group.fst") |>
+  as_tibble()
 
 full_vs_group$label <- with(
   full_vs_group,
@@ -384,6 +433,7 @@ full_vs_group$label <- with(
 ```{r}
 set.seed(1234)
 fvg_p <- full_vs_group |>
+  filter(.metric %in% c("mae", "rmse", "rsq")) |>
   mutate(.metric = toupper(.metric)) |>
   ggplot(aes(x = label, y = .estimate, color = label)) +
   geom_half_boxplot(nudge = 0.15, outlier.shape = NA) +
@@ -577,7 +627,7 @@ se_tree_p <- simulation_plot("se", TRUE, remove_mi = TRUE) +
 # slideimp
 ## Endometriosis
 ```{r}
-clock_rmiss <- qs2::qs_read(here::here("data", "03.slide_imp.CpGs_wise_missing.qs2"))
+# clock_rmiss <- qs2::qs_read(here::here("data", "03.slide_imp.CpGs_wise_missing.qs2"))
 # clock_rmiss |>
 #   filter(clock == "PCClocks") |>
 #   unnest(miss) |>

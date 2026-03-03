@@ -55,6 +55,7 @@ library(qs2)
 library(duckdb)
 library(ggplot2)
 library(tidyverse)
+library(slideimp.extra)
 source("utils.R")
 ```
 
@@ -318,6 +319,7 @@ saveRDS(
 # Memory
 The `bench::mark` tool may not be measuring memory profile of underlying R codes accurately. So we profile peak memory usage using gnu time. The HPC has different nodes but peak memory useage should be the same across all of them.
 
+## Script
 ```{r memory.R, eval =  F}
 library(argparser)
 
@@ -400,6 +402,7 @@ if (!argv$baseline) {
 }
 ```
 
+## Slurm
 ```{r}
 library(tidyverse)
 
@@ -519,20 +522,22 @@ viz_df |>
 ```
 
 # Multi Cores
-* R2 requests that the benchmark done on multiple cores. We perform grouped imputation on the first 8 chromosomes of the EPICv2 GSE286313 data using 4/8 cores (1/2 iterations) in parallel.
+* R2 requests that the benchmark done on multiple cores. We perform grouped imputation on the EPICv2 GSE286313 data using 4/8/12 cores in parallel.
 * Scenarios will be K-NN, pca_imp, methyLImp2 PSOCK, and methyLImp2 FORK.
 * We will also have to pin the jobs to a specific node for maximum reproducibility.
 
 ## Prep
 ```{r}
+library(slideimp.extra)
+
 beta_matrix <- do.call(
   rbind,
   lapply(
     get_DNAm(
       "EPICv2",
-      c(glue::glue("chr{1:8}"))
-      # c(glue::glue("all"))
-    )$path, 
+      # c(glue::glue("chr{1:8}"))
+      c(glue::glue("all"))
+    )$path,
     qs_read
   )
 ) |>
@@ -541,15 +546,322 @@ beta_matrix <- do.call(
 # beta_matrix <- dedup_matrix(beta_matrix, "EPICv2")
 cv <- col_vars(beta_matrix)
 
+beta_matrix |> dim()
 beta_matrix <- beta_matrix[, !is.na(cv) & cv > 0]
 beta_matrix |> dim()
+beta_matrix <- beta_matrix[, (colSums(is.na(beta_matrix)) / nrow(beta_matrix)) < 0.9]
+beta_matrix |> dim()
 
-EPICv2 <- subset(ilmn_manifest("EPICv2", dedupped = FALSE), group != "0")
+group_df <- group_features(beta_matrix, ilmn_manifest("EPICv2", dedupped = FALSE))
+group_df <- dplyr::filter(group_df, !group %in% c("0", "M"))
 
-group_df <- group_features(beta_matrix, EPICv2)
+qs2::qs_save(beta_matrix, here("GSE286313", "GSE286313.EPICv2.chr1-Y.qs2"))
+qs2::qs_save(group_df, here("GSE286313", "GSE286313.EPICv2.chr1-Y.group_df.qs2"))
+```
 
-qs2::qs_save(beta_matrix, here("GSE286313", "GSE286313.EPICv2.chr1-8.qs2"))
-qs2::qs_save(group_df, here("GSE286313", "GSE286313.EPICv2.chr1-8.group_df.qs2"))
+## Script
+```{r benchmark.R, eval = F}
+library(argparser)
+
+p <- arg_parser("benchmark")
+p <- add_argument(p, "--beta", help = "beta matrix file path", type = "character")
+p <- add_argument(p, "--group", help = "group file path", type = "character")
+p <- add_argument(p, "--cores", help = "number of cores", type = "integer")
+p <- add_argument(
+  p, "--method",
+  help = "knn, knn_tree, pca, missMDA, impute.knn, methyLImp2_fork, methyLImp2_psock",
+  type = "character"
+)
+p <- add_argument(p, "--debug", help = "enable debug mode", flag = TRUE)
+argv <- parse_args(
+  p
+  ,
+  c(
+  "--beta", here::here("GSE286313", "GSE286313.EPICv2.chr1-Y.qs2"),
+  "--group", here::here("GSE286313", "GSE286313.EPICv2.chr1-Y.group_df.qs2"),
+  "--cores", "1",
+  "--method", "pca"
+  # , "--debug"
+  )
+)
+stopifnot(
+  argv$method %in% c("knn", "knn_tree", "pca", "missMDA", "impute.knn", "methyLImp2_fork", "methyLImp2_psock")
+)
+stopifnot(file.exists(argv$beta), file.exists(argv$group))
+beta_matrix <- qs2::qs_read(argv$beta)
+group_df <- qs2::qs_read(argv$group)
+if (argv$debug) {
+  message("debug, ", argv$method, " ;cores, ", argv$cores)
+  group_df <- subset(group_df, group %in% c("21", "22"))
+  beta_matrix <- beta_matrix[, do.call(c, group_df$features)]
+  .progress <- TRUE
+} else {
+  message("full run, ", argv$method, " ;cores, ", argv$cores)
+  .progress <- FALSE
+}
+set.seed(1234)
+if (argv$method == "knn") {
+  library(slideimp)
+  results <- group_imp(
+    beta_matrix,
+    group = group_df,
+    k = 20,
+    cores = argv$cores,
+    .progress = .progress
+  )
+} else if (argv$method == "knn_tree") {
+  library(slideimp)
+  results <- group_imp(
+    beta_matrix,
+    group = group_df,
+    k = 20,
+    tree = "ball",
+    cores = argv$cores,
+    .progress = .progress
+  )
+} else if (argv$method == "pca") {
+  library(slideimp)
+  library(mirai)
+  if (argv$cores > 1) {
+    daemons(argv$cores)
+  }
+  results <- group_imp(
+    beta_matrix,
+    group = group_df,
+    ncp = 10,
+    maxiter = 5000,
+    .progress = .progress
+  )
+  daemons(0)
+} else if (argv$method == "missMDA") {
+  library(missMDA)
+  library(furrr)
+  options(future.globals.maxSize = 1.0 * 1e9)
+  if (argv$cores > 1) {
+    plan(multisession, workers = argv$cores)
+  }
+
+  results <- future_map(
+    group_df$features,
+    \(features) imputePCA(
+      X = beta_matrix[, features, drop = FALSE],
+      ncp = 10,
+      maxiter = 5000
+    )$completeObs,
+    .options = furrr_options(seed = TRUE),
+    .progress = .progress
+  )
+  results <- do.call(cbind, results)
+
+  plan(sequential)
+} else if (argv$method == "impute.knn") {
+  library(impute)
+  library(furrr)
+  options(future.globals.maxSize = 1.0 * 1e9)
+  if (argv$cores > 1) {
+    plan(multisession, workers = argv$cores)
+  }
+
+  results <- future_map(
+    group_df$features,
+    \(features) t(
+      impute.knn(
+        t(beta_matrix[, features, drop = FALSE]),
+        k = 20,
+        colmax = 0.98,
+      )$data
+    ),
+    .options = furrr_options(seed = TRUE),
+    .progress = .progress
+  )
+  results <- do.call(cbind, results)
+
+  plan(sequential)
+} else if (argv$method %in% c("methyLImp2_fork", "methyLImp2_psock")) {
+  library(methyLImp2)
+  library(BiocParallel)
+  annotation_df <- tidyr::unnest(group_df, cols = features)
+  names(annotation_df) <- c("cpg", "chr")
+  BPPARAM <- if (argv$cores > 1) {
+    if (argv$method == "methyLImp2_psock") {
+      SnowParam(workers = argv$cores, type = "SOCK", progressbar = .progress)
+    } else {
+      MulticoreParam(workers = argv$cores, progressbar = .progress)
+    }
+  } else {
+    SerialParam(progressbar = .progress)
+  }
+  results <- methyLImp2(
+    input = beta_matrix,
+    type = "user",
+    annotation = annotation_df,
+    BPPARAM = BPPARAM
+  )
+}
+```
+
+## Slurm
+```{r}
+library(tidyverse)
+
+all_jobs <- tidyr::expand_grid(
+  method = c("knn", "knn_tree", "impute.knn", "missMDA", "pca", "methyLImp2_fork", "methyLImp2_psock"),
+  cores = c(1, 2, 4, 8, 12),
+  rep = 1:5
+) |>
+  filter(!(method == "methyLImp2_fork" & cores %in% c(1, 2, 8, 12)))
+
+all_jobs$output <- with(all_jobs, glue::glue("output/{method}-{cores}-{rep}"))
+
+all_jobs$job <- with(all_jobs, glue::glue(
+  '/usr/bin/time -f "%U\\t%S\\t%e\\t%P\\t%M" -o {output}.txt',
+  "apptainer exec $APPTAINER/missRanger/missRanger.sif Rscript benchmark.R",
+  "--beta input/GSE286313.EPICv2.chr1-Y.qs2 --group input/GSE286313.EPICv2.chr1-Y.group_df.qs2",
+  "--cores {cores} --method {method}",
+  .sep = " "
+))
+
+all_jobs <- tidyr::nest(all_jobs, .by = "cores")
+
+all_jobs$joblist <- here::here(
+  "benchmark",
+  "multi_cores",
+  glue::glue("joblist_{all_jobs$cores}.txt")
+)
+
+purrr::walk2(
+  all_jobs$data,
+  all_jobs$joblist,
+  \(x, y) {
+    readr::write_lines(x$job, y)
+  }
+)
+
+all_jobs$dsq <- glue::glue(
+  "dsq --job-file input/joblist_{all_jobs$cores}.txt --batch-file multi_cores_{all_jobs$cores}.sh",
+  "--job-name multi_cores_{all_jobs$cores} --max-jobs {c(10, 10, 10, 10, 5)}",
+  "--output dSQ/dsq-multi_cores_{all_jobs$cores}-%A_%a-%N.out --status-dir .",
+  "--time 03:00:00 --nodes 1 --ntasks-per-node 1 --cpus-per-task {all_jobs$cores}",
+  "--mem {c(40, 40, 40, 40, 60)}G --partition day",
+  .sep = " "
+) |>
+  as.character()
+
+all_jobs$dsq
+```
+
+```{r}
+library(here)
+library(hhprf)
+library(tidyverse)
+
+job_status <- tibble(
+  jl = here(
+    "benchmark", "multi_cores",
+    c(
+      "job_5423567_status.tsv",
+      "job_5423685_status.tsv",
+      "job_5424266_status.tsv"
+    )
+  ),
+  out = here(
+    "benchmark", "multi_cores",
+    c("joblist_4.txt", "joblist_8.txt", "joblist_12.txt")
+  )
+)
+
+map2(job_status$jl, job_status$out, hhprf::retry_dsq)
+```
+
+## Viz
+Ran the jobs using Slurm and /usr/time. We can use slurm sacc -j to query the actual RSS and Wall Time.
+
+The output/ results are less correct but can be used as backup.
+```{r}
+library(tidyverse)
+
+multi_cores <- tibble(
+  files = list.files("benchmark/multi_cores/dSQ"),
+  paths = list.files("benchmark/multi_cores/dSQ", full.names = TRUE)
+)
+
+multi_cores$output <- lapply(multi_cores$paths, read_lines)
+multi_cores$output |>
+  lapply(\(x) {
+    grepv("full run", x)
+  }) |>
+  unique()
+
+extractor <- function(x) {
+  method <- if (any(str_detect(x, "knn_tree"))) {
+    "knn_tree"
+  } else if (any(str_detect(x, "impute.knn"))) {
+    "impute.knn"
+  } else if (any(str_detect(x, "knn"))) {
+    "knn"
+  } else if (any(str_detect(x, "pca"))) {
+    "pca"
+  } else if (any(str_detect(x, "missMDA"))) {
+    "missMDA"
+  } else if (any(str_detect(x, "methyLImp2_psock"))) {
+    "methyLImp2_psock"
+  } else if (any(str_detect(x, "methyLImp2_fork"))) {
+    "methyLImp2_fork"
+  } else {
+    stop("Failed: ", x)
+  }
+  return(method)
+}
+
+multi_cores$method <- vapply(multi_cores$output, extractor, character(1))
+multi_cores$cores <- as.numeric(
+  str_extract(multi_cores$files, "(?<=multi_cores_)\\d+(?=-)")
+)
+multi_cores$job_id <- str_extract(multi_cores$files, "(?<=-)[0-9]+_[0-9]+(?=-)")
+multi_cores[c("files", "paths", "output")] <- NULL
+multi_cores |> print(n = Inf)
+
+cmd <- glue::glue(
+  "sacct -j", "{paste0(multi_cores$job_id, collapse = ',')}",
+  "--format=JobID,JobName,State,Elapsed,MaxRSS,TotalCPU",
+  "--parsable > multi_cores_raw.txt",
+  .sep = " "
+)
+
+cmd
+```
+
+```{r}
+library(scales)
+multi_cores_raw <- read_delim(
+  here::here("benchmark", "multi_cores", "multi_cores_raw.txt"),
+  delim = "|",
+) |>
+  filter(State == "COMPLETED", JobName == "batch") |>
+  mutate(
+    job_id = str_remove(JobID, ".batch"),
+    JobID = NULL,
+    State = NULL,
+    `...7` = NULL,
+    JobName = NULL,
+    max_rss_bytes = case_when(
+      str_detect(MaxRSS, "K$") ~ readr::parse_number(MaxRSS) * 1024,
+      str_detect(MaxRSS, "M$") ~ readr::parse_number(MaxRSS) * 1024^2,
+      TRUE ~ readr::parse_number(MaxRSS)
+    ),
+    MaxRSS = NULL
+  )
+
+multi_cores_output <- inner_join(
+  multi_cores,
+  multi_cores_raw,
+  by = "job_id"
+)
+
+saveRDS(
+  multi_cores_output,
+  here::here("benchmark", "multi_cores", "multi_cores_output.rds")
+)
 ```
 
 # Accuracy
@@ -801,7 +1113,9 @@ knn_imp_param <- tibble::tibble(
 # pca_imp params
 pca_imp_param <- tibble::tibble(
   ncp = 30,
-  coeff.ridge = 1
+  coeff.ridge = 1,
+  row.w = "n_miss",
+  nb.init = 5
 )
 
 methyLImp2_param <- tibble::tibble(id = 1)
@@ -829,7 +1143,7 @@ num_na <- if (argv$debug) {
 rep <- if (argv$debug) {
   1
 } else {
-  14
+  30
 }
 for (perc in global_na_percs) {
   # Inject global NA level
@@ -946,8 +1260,8 @@ joblist <- glue::glue(
   "--platform EPICv1",
   "--chr 22",
   "--output benchmark",
-  "--cores 14",
-  "--global_na {c(0, 0.01, 0.025, 0.05, 0.075, 0.1)}",
+  "--cores 15",
+  "--global_na {c(0, 0.01, 0.025, 0.05)}",
   .sep = " "
 )
 
@@ -956,18 +1270,19 @@ joblist <- glue::glue(
 #   batch_file = "fit_imp_mcar.sh",
 #   job_name = "fit_imp_mcar",
 #   output = "dSQ/dsq-jobfile-%A_%a-%N.out",
-#   max_jobs = 6,
+#   max_jobs = 2,
 #   slurm_args = slurm_par(
 #     time = "02:00:00",
 #     cpus_per_task = "15",
 #     mem = "30G"
 #   )
 # )
-# dsq --job-file joblist.txt --batch-file fit_imp_mcar.sh --job-name fit_imp_mcar --max-jobs 6 --output dSQ/dsq-jobfile-%A_%a-%N.out --status-dir . --time 02:00:00 --nodes 1 --ntasks-per-node 1 --cpus-per-task 15 --mem 30G --partition day
+
+# dsq --job-file joblist.txt --batch-file fit_imp_mcar.sh --job-name fit_imp_mcar --max-jobs 2 --output dSQ/dsq-jobfile-%A_%a-%N.out --status-dir . --time 02:00:00 --nodes 1 --ntasks-per-node 1 --cpus-per-task 15 --mem 30G --partition day
 ```
 
 ## `group_imp`
-Benchmark accuracy of `group_imp` vs full `knn_imp` and `pca_imp` on the chromosome 1:22 of the MSA chip. Focus on values in just `300` random columns each with `20` values (6,000 missing values to measure RMSE/MAE/RSQ). Do this for multiple reps.
+Benchmark accuracy of `group_imp` vs full `knn_imp` and `pca_imp` on the chromosome 1:22 of the MSA chip. Focus on values in just `400` random columns each with `25` values (10,000 missing values to measure RMSE/MAE/RSQ). Do this for multiple reps.
 
 ```{r}
 # Get MSA data
@@ -987,77 +1302,56 @@ MSA <- MSA[, !(is.na(cv) & dplyr::near(cv, 0))]
 dim(MSA)
 
 # Get manifest. Needed for `group_imp`
-MSA_manifest <- arrow::read_parquet(get_manifest_obj("MSA"))
-all_probes <- intersect(colnames(MSA), MSA_manifest$IlmnID)
+MSA_manifest <- ilmn_manifest("MSA")
+all_probes <- intersect(colnames(MSA), MSA_manifest$feature_id)
 
 # Align
-MSA_manifest <- subset(MSA_manifest, IlmnID %in% all_probes)
+MSA_manifest <- subset(MSA_manifest, feature_id %in% all_probes)
 MSA <- MSA[, all_probes]
 
 # Select columns
 n_rep <- 30
 set.seed(1234)
+
 missing_2d <- tibble(
   rep = seq_len(n_rep),
-  IlmnID = lapply(rep, \(x) sample(MSA_manifest$IlmnID, size = 300))
+  IlmnID = lapply(rep, \(x) sample(MSA_manifest$feature_id, size = 400))
 ) |>
   unnest(cols = "IlmnID") |>
   mutate(
     col_index = match(IlmnID, colnames(MSA)),
     row_index = lapply(IlmnID, \(x) {
-      # for each column, 20 values are missing
-      sample.int(nrow(MSA), size = 20)
+      # for each column, 25 values are missing
+      sample.int(nrow(MSA), size = 25)
     })
   ) |>
   unnest(cols = "row_index")
 
-# linear = offset + row_index.
-missing_2d$linear_index <- (missing_2d$col_index - 1) * nrow(MSA) + missing_2d$row_index
-# sanity check on linear position to 2d position
-for (i in 1:100) {
-  v1 <- MSA[missing_2d$linear_index[i]]
-  v2 <- MSA[
-    missing_2d$row_index[i],
-    missing_2d$col_index[i]
-  ]
-  stopifnot(
-    v1 == v2 | is.na(v1) == is.na(v2)
-  )
-}
-
-# From here we can calculate the fixed NA positions
 na_positions <- missing_2d |>
-  select(rep, linear_index) |>
   nest(.by = "rep") |>
-  mutate(data = lapply(data, \(x) {
-    x$linear_index
-  })) |>
-  arrange(rep)
+  mutate(location = lapply(
+    data, \(x) {
+      m <- cbind(x$row_index, x$col_index)
+      colnames(m) <- c("row", "col")
+      m
+    }
+  ))
 
-# Column subset
-nested_manifest <- nest(as_tibble(MSA_manifest), aux = IlmnID, .by = "CHR") |>
-  mutate(aux = lapply(aux, \(x) {
-    x$IlmnID
-  }))
+na_positions$subset <- lapply(
+  na_positions$data,
+  \(x) unique(x$IlmnID)
+)
 
-column_positions <- missing_2d |>
-  select(rep, IlmnID) |>
-  nest(.by = "rep") |>
-  mutate(data = lapply(data, \(x) {
-    unique(x$IlmnID)
-  })) |>
-  mutate(
-    group_df = lapply(data, \(x) {
-      mutate(nested_manifest, features = lapply(aux, \(y) {
-        intersect(x, y)
-      }))
-    })
-  ) |>
-  arrange(rep)
+na_positions$group_df <- lapply(
+  na_positions$subset,
+  \(x) group_features(MSA, features_df = MSA_manifest, subset = x)
+)
 
-dir.create("benchmark/group_imp/input")
+na_positions[, c("data")] <- NULL
+if (!dir.exists("benchmark/group_imp/input")) {
+  dir.create("benchmark/group_imp/input")
+}
 qs2::qs_save(na_positions, "benchmark/group_imp/input/na_positions.qs2")
-qs2::qs_save(column_positions, "benchmark/group_imp/input/column_positions.qs2")
 qs2::qs_save(MSA, "benchmark/group_imp/input/MSA.qs2")
 ```
 
@@ -1073,9 +1367,7 @@ library(qs2)
 # Set up argument parser
 p <- arg_parser("Run group/full imputation with knn/pca method")
 p <- add_argument(p, "--na_positions", help = "Path to na_positions object")
-p <- add_argument(p, "--column_positions", help = "Path to column_position object")
 p <- add_argument(p, "--MSA", help = "Path to MSA object")
-p <- add_argument(p, "--cores", help = "Number of cores", type = "integer")
 p <- add_argument(p, "--output", help = "Output path")
 p <- add_argument(p, "--rep", help = "Repeat number", type = "integer")
 p <- add_argument(p, "--method", help = "Method: pca or knn")
@@ -1086,42 +1378,41 @@ argv <- parse_args(
   # ,
   # c(
   #   "--na_positions", "benchmark/group_imp/input/na_positions.qs2",
-  #   "--column_positions", "benchmark/group_imp/input/column_positions.qs2",
   #   "--MSA", "benchmark/group_imp/input/MSA.qs2",
-  #   "--cores", 7,
   #   "--output", "benchmark/group_imp/output",
   #   "--rep", 1,
-  #   "--method", "pca",
+  #   "--method", "knn",
   #   "--group", "group"
   # )
 )
 
 # Check that paths exist
 stopifnot(file.exists(argv$na_position))
-stopifnot(file.exists(argv$column_position))
 stopifnot(file.exists(argv$MSA))
 stopifnot(dir.exists(argv$output))
 
 # Load data
 na_positions <- qs_read(argv$na_position)
-column_positions <- qs_read(argv$column_position)
 MSA <- qs_read(argv$MSA)
 
 # Output file path
-results <- file.path(argv$output, glue("{argv$method}-{argv$group}-{argv$rep}.fst"))
+results <- file.path(
+  argv$output,
+  glue::glue("{argv$method}-{argv$group}-{argv$rep}.fst")
+)
 
 # Set parameters
 k <- 25
 ncp <- 25
 
 set.seed(12345)
+
 # Wrapper functions
 group_imp_knn_wrap <- function(obj, group_df) {
   imputed <- group_imp(
     obj = obj,
     k = k,
-    group = group_df,
-    cores = argv$cores
+    group = group_df
   )[, colnames(obj)]
   return(imputed)
 }
@@ -1139,8 +1430,7 @@ knn_imp_wrap <- function(obj, subset) {
   imputed <- knn_imp(
     obj = obj,
     k = k,
-    subset = subset,
-    cores = argv$cores
+    subset = subset
   )
   obj[, subset] <- imputed[, subset]
   return(obj)
@@ -1158,12 +1448,12 @@ pca_imp_wrap <- function(obj, subset) {
 i <- argv$rep
 message("Processing rep ", i)
 
-# Get the linear position of missing for `tune_imp`
-position <- list(na_positions$data[[i]])
+# Get the position of missing for `tune_imp`
+position <- list(na_positions$location[[i]])
 # Get the column names for this rep
-subset <- list(column_positions$data[[i]])
+subset <- list(na_positions$subset[[i]])
 # Get the group_df for this rep
-group_df <- list(column_positions$group_df[[i]])
+group_df <- list(na_positions$group_df[[i]])
 
 # Run the appropriate combination based on method and group
 if (argv$method == "knn" && argv$group == "full") {
@@ -1216,7 +1506,6 @@ message("Done!")
 ```{r}
 joblist_tbl <- tidyr::expand_grid(
   "na_positions" = "input/na_positions.qs2",
-  "column_positions" = "input/column_positions.qs2",
   "MSA" = "input/MSA.qs2",
   "output" = "output",
   "rep" = 1:30,
@@ -1229,7 +1518,6 @@ joblist_tbl$joblist <- with(
   glue::glue(
     "apptainer exec $APPTAINER/missRanger/missRanger.sif Rscript group_imp.R",
     "--na_positions", "{na_positions}",
-    "--column_positions", "{column_positions}",
     "--MSA", "{MSA}",
     "--output", "{output}",
     "--rep", "{rep}",
@@ -1239,12 +1527,10 @@ joblist_tbl$joblist <- with(
   )
 )
 
-# PCA runs on the HPC
-joblist_pca_tbl <- subset(joblist_tbl, method == "pca")
+readr::write_lines(joblist_tbl$joblist, "benchmark/group_imp/joblist.txt")
 
-readr::write_lines(joblist_pca_tbl$joblist, "benchmark/group_imp/joblist_pca.txt")
 dsq_gen(
-  "joblist_pca.txt",
+  "joblist.txt",
   batch_file = "group_imp.sh",
   job_name = "group_imp",
   output = "dSQ/dsq-jobfile-%A_%a-%N.out",
@@ -1255,23 +1541,28 @@ dsq_gen(
     mem = "30G"
   )
 )
-# dsq --job-file joblist_pca.txt --batch-file group_imp.sh --job-name group_imp --max-jobs 30 --output dSQ/dsq-jobfile-%A_%a-%N.out --status-dir . --time 05:00:00 --nodes 1 --ntasks-per-node 1 --cpus-per-task 1 --mem 30G --partition day
 
-# KNN runs locally
-joblist_knn_tbl <- subset(joblist_tbl, method == "knn")
-joblist_knn_tbl$joblist <- glue::glue("{joblist_knn_tbl$joblist} --cores 7")
-extracted_string <- substr(joblist_knn_tbl$joblist, 53, nchar(joblist_knn_tbl$joblist))
-readr::write_lines(extracted_string, "benchmark/group_imp/joblist_knn.txt")
-
-file.edit("benchmark/group_imp/group_imp.R")
-file.edit("benchmark/group_imp/run_jobs.bat")
+# dsq --job-file joblist.txt --batch-file group_imp.sh --job-name group_imp --max-jobs 30 --output dSQ/dsq-jobfile-%A_%a-%N.out --status-dir . --time 12:00:00 --nodes 1 --ntasks-per-node 1 --cpus-per-task 1 --mem 30G --partition day
 ```
 
-```{bat, run_jobs.bat}
-@echo off
-for /f "usebackq delims=" %%i in ("joblist_knn.txt") do (
-    echo Running: %%i
-    %%i
-)
-pause
+### Viz
+```{r}
+group_imp <- tibble(
+  files = list.files("benchmark/group_imp/output"),
+  paths = list.files("benchmark/group_imp/output", full.names = TRUE)
+) |>
+  separate_wider_delim(
+    cols = "files",
+    delim = "-", names = c("method", "group", "rep")
+  ) |>
+  mutate(result = lapply(paths, fst::read_fst))
+
+class(group_imp) <- c("TuneImp", "tbl_df", "tbl", "data.frame")
+
+group_imp <- compute_metrics(group_imp, c("mae", "rmse", "rsq", "bias"))
+group_imp$paths <- NULL
+group_imp$rep <- as.numeric(str_remove(group_imp$rep, ".fst"))
+
+fst::write_fst(group_imp, "benchmark/full_vs_group.fst")
 ```
+
