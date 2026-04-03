@@ -68,27 +68,27 @@ abbrv <- function(terms = NULL) {
 
 str_wrap1 <- function(string, width = 80, ...) {
   tags <- unique(stringr::str_extract_all(string, "<[^>]+>")[[1]])
-  
+
   if (length(tags) == 0) {
     return(
       stringr::str_wrap(string, width = width, ...) |>
         stringr::str_replace_all("\n", "<br>")
     )
   }
-  
+
   placeholders <- intToUtf8(0xE000 + seq_along(tags) - 1, multiple = TRUE)
   temp <- string
   for (i in seq_along(tags)) {
     temp <- gsub(tags[i], placeholders[i], temp, fixed = TRUE)
   }
-  
+
   wrapped <- stringr::str_wrap(temp, width = width, ...) |>
     stringr::str_replace_all("\n", "<br>")
-  
+
   for (i in seq_along(tags)) {
     wrapped <- gsub(placeholders[i], tags[i], wrapped, fixed = TRUE)
   }
-  
+
   wrapped
 }
 
@@ -305,14 +305,14 @@ EPIC_rss_plot <- multi_cores_viz |>
   ) +
   scale_color_manual(
     values = c("#D95F02", "#1B9E77", "#66A61E", "#7570B3", "#E7298A")
-  ) + 
+  ) +
   labs(
-  title = "Peak Memory Usage (GB) by Imputation Methods",
-  subtitle = "GSE286313, EPICv2: N=72 × 899,653 CpGs",
-  x = "Number of parallel cores",
-  y = expression("Peak Memory Usage (GB)"),
-  color = NULL
-) +
+    title = "Peak Memory Usage (GB) by Imputation Methods",
+    subtitle = "GSE286313, EPICv2: N=72 × 899,653 CpGs",
+    x = "Number of parallel cores",
+    y = expression("Peak Memory Usage (GB)"),
+    color = NULL
+  ) +
   scale_x_continuous(breaks = c(1, 2, 4, 8)) +
   theme(
     legend.position = "none",
@@ -336,10 +336,9 @@ wide$knn / wide$knn_tree_chr
 wide_m <- multi_cores_output |>
   select(cores, method, median_max_rss_bytes) |>
   filter(cores < 12) |>
-  pivot_wider(id_cols = cores, names_from = method, values_from = median_max_rss_bytes )
+  pivot_wider(id_cols = cores, names_from = method, values_from = median_max_rss_bytes)
 
 wide_m$methyLImp2_psock / wide_m$knn
-
 ```
 
 # Accuracy
@@ -949,7 +948,7 @@ ggsave(
   plot = figure_1,
   width = 7,
   height = 5,
-  units = "in", 
+  units = "in",
   dpi = 350,
   device = "tiff"
 )

@@ -84,6 +84,12 @@ qs2::qs_save(group_df, here("GSE286313", "GSE286313.EPICv2.chr1-Y.group_df.qs2")
 ## Script
 ```{r benchmark.R, eval = F}
 library(argparser)
+library(here)
+library(qs2)
+library(tibble)
+library(readr)
+library(tidyr)
+library(syrup)
 
 p <- arg_parser("benchmark")
 p <- add_argument(p, "--beta", help = "beta matrix file path", type = "character")
@@ -91,36 +97,41 @@ p <- add_argument(p, "--group", help = "group file path", type = "character")
 p <- add_argument(p, "--cores", help = "number of cores", type = "integer")
 p <- add_argument(
   p, "--method",
-  help = "knn, knn_tree, knn_tree_chr, pca, missMDA, impute.knn, methyLImp2_fork, methyLImp2_psock",
+  help = "knn, knn_tree_chr, pca, missMDA, impute.knn, methyLImp2_psock",
   type = "character"
 )
+p <- add_argument(p, "--output", help = "output directory", type = "character")
+p <- add_argument(p, "--rep", help = "repetition number", type = "integer", default = 1L)
 p <- add_argument(p, "--debug", help = "enable debug mode", flag = TRUE)
+p <- add_argument(p, "--force", help = "force", flag = TRUE)
+
 argv <- parse_args(
-  p
-  # ,
-  # c(
-  #   "--beta", here::here("GSE286313", "GSE286313.EPICv2.chr1-Y.qs2"),
-  #   "--group", here::here("GSE286313", "GSE286313.EPICv2.chr1-Y.group_df.qs2"),
-  #   "--cores", "1",
-  #   "--method", "impute.knn"
-  #   , "--debug"
-  # )
-)
-stopifnot(
-  argv$method %in% c(
-    "knn",
-    "knn_tree",
-    "knn_tree_chr",
-    "pca",
-    "missMDA",
-    "impute.knn",
-    "methyLImp2_fork",
-    "methyLImp2_psock"
+  p,
+  c(
+    "--beta", here::here("GSE286313", "GSE286313.EPICv2.chr1-Y.qs2"),
+    "--group", here::here("GSE286313", "GSE286313.EPICv2.chr1-Y.group_df.qs2"),
+    "--cores", "1",
+    "--method", "knn",
+    "--output", here::here("benchmark", "multi_cores", "syrup"),
+    "--rep", "3"
+    # , "--debug"
   )
 )
+
+stopifnot(
+  argv$method %in% c(
+    "knn", "knn_tree_chr", "pca", "missMDA", "impute.knn", "methyLImp2_psock"
+  )
+)
+set.seed(argv$rep)
 stopifnot(file.exists(argv$beta), file.exists(argv$group))
+if (!dir.exists(argv$output)) {
+  dir.create(argv$output, recursive = TRUE)
+}
+
 beta_matrix <- qs2::qs_read(argv$beta)
 group_df <- qs2::qs_read(argv$group)
+
 if (argv$debug) {
   message("debug, ", argv$method, " ;cores, ", argv$cores)
   group_df <- subset(group_df, group %in% c("21", "22"))
@@ -130,63 +141,55 @@ if (argv$debug) {
   message("full run, ", argv$method, " ;cores, ", argv$cores)
   .progress <- FALSE
 }
-set.seed(1234)
-if (argv$method == "knn") {
+
+# method functions
+run_knn <- function(beta_matrix, group_df, cores, .progress) {
   library(slideimp)
-  results <- group_imp(
+  group_imp(
     beta_matrix,
     group = group_df,
     k = 20,
-    cores = argv$cores,
+    cores = cores,
+    colmax = 0.98,
+    post_imp = FALSE,
     .progress = .progress
   )
-} else if (argv$method == "knn_tree") {
-  library(slideimp)
-  results <- group_imp(
-    beta_matrix,
-    group = group_df,
-    k = 20,
-    tree = TRUE,
-    cores = argv$cores,
-    .progress = .progress
-  )
-} else if (argv$method == "knn_tree_chr") {
+}
+run_knn_tree_chr <- function(beta_matrix, group_df, cores, .progress) {
   library(slideimp)
   library(mirai)
-  if (argv$cores > 1) {
-    daemons(argv$cores)
-  }
-  results <- group_imp(
+  if (cores > 1) daemons(cores)
+  on.exit(daemons(0), add = TRUE)
+  group_imp(
     beta_matrix,
     group = group_df,
     k = 20,
     tree = TRUE,
     cores = 1,
+    colmax = 0.98,
     .progress = .progress
   )
-  daemons(0)
-} else if (argv$method == "pca") {
+}
+run_pca <- function(beta_matrix, group_df, cores, .progress) {
   library(slideimp)
   library(mirai)
-  if (argv$cores > 1) {
-    daemons(argv$cores)
-  }
-  results <- group_imp(
+  if (cores > 1) daemons(cores)
+  on.exit(daemons(0), add = TRUE)
+  group_imp(
     beta_matrix,
     group = group_df,
     ncp = 10,
     maxiter = 5000,
+    colmax = 0.98,
     .progress = .progress
   )
-  daemons(0)
-} else if (argv$method == "missMDA") {
+}
+run_missMDA <- function(beta_matrix, group_df, cores, .progress) {
   library(missMDA)
   library(furrr)
   options(future.globals.maxSize = 1.0 * 1e9)
-  if (argv$cores > 1) {
-    plan(multisession, workers = argv$cores)
-  }
-
+  if (cores > 1) plan(multisession, workers = cores)
+  on.exit(plan(sequential), add = TRUE)
   results <- future_map(
     group_df$features,
     \(features) {
@@ -199,17 +202,14 @@ if (argv$method == "knn") {
     .options = furrr_options(seed = TRUE),
     .progress = .progress
   )
-  results <- do.call(cbind, results)
-
-  plan(sequential)
-} else if (argv$method == "impute.knn") {
+  do.call(cbind, results)
+}
+run_impute_knn <- function(beta_matrix, group_df, cores, .progress) {
   library(impute)
   library(furrr)
   options(future.globals.maxSize = 1.0 * 1e9)
-  if (argv$cores > 1) {
-    plan(multisession, workers = argv$cores)
-  }
-
+  if (cores > 1) plan(multisession, workers = cores)
+  on.exit(plan(sequential), add = TRUE)
   results <- future_map(
     group_df$features,
     \(features) {
@@ -217,39 +217,135 @@ if (argv$method == "knn") {
         impute.knn(
           t(beta_matrix[, features, drop = FALSE]),
           k = 20,
-          # FULL K-NN.
           maxp = length(features),
-          colmax = 0.98,
+          colmax = 0.98
         )$data
       )
     },
     .options = furrr_options(seed = TRUE),
     .progress = .progress
   )
-  results <- do.call(cbind, results)
-
-  plan(sequential)
-} else if (argv$method %in% c("methyLImp2_fork", "methyLImp2_psock")) {
+  do.call(cbind, results)
+}
+run_methyLImp2 <- function(beta_matrix, group_df, cores, .progress, type) {
   suppressMessages(library(methyLImp2))
   suppressMessages(library(BiocParallel))
   annotation_df <- tidyr::unnest(group_df, cols = features)
   names(annotation_df) <- c("cpg", "chr")
-  BPPARAM <- if (argv$cores > 1) {
-    if (argv$method == "methyLImp2_psock") {
-      SnowParam(workers = argv$cores, type = "SOCK", progressbar = .progress)
+  BPPARAM <- if (cores > 1) {
+    if (type == "methyLImp2_psock") {
+      SnowParam(workers = cores, type = "SOCK", progressbar = .progress)
     } else {
-      MulticoreParam(workers = argv$cores, progressbar = .progress)
+      MulticoreParam(workers = cores, progressbar = .progress)
     }
   } else {
     SerialParam(progressbar = .progress)
   }
-  results <- methyLImp2(
+  methyLImp2(
     input = beta_matrix,
     type = "user",
     annotation = annotation_df,
     BPPARAM = BPPARAM
   )
 }
+# dispatch
+method_fn <- switch(argv$method,
+  knn = \() run_knn(beta_matrix, group_df, argv$cores, .progress),
+  knn_tree_chr = \() run_knn_tree_chr(beta_matrix, group_df, argv$cores, .progress),
+  pca = \() run_pca(beta_matrix, group_df, argv$cores, .progress),
+  missMDA = \() run_missMDA(beta_matrix, group_df, argv$cores, .progress),
+  impute.knn = \() run_impute_knn(beta_matrix, group_df, argv$cores, .progress),
+  methyLImp2_psock = \() run_methyLImp2(beta_matrix, group_df, argv$cores, .progress, "methyLImp2_psock"),
+  # remove the fork version unless you really want it
+  stop(paste("Unknown method:", argv$method))
+)
+
+prefix <- sprintf("%s-%d-%d", argv$method, argv$cores, argv$rep)
+max_attempts <- 5L
+profile <- NULL
+attempt <- 0L
+
+while (is.null(profile) && attempt < max_attempts) {
+  attempt <- attempt + 1L
+  tryCatch(
+    expr = {
+      profile <- syrup::syrup(invisible(method_fn()), interval = 0.25)
+      # Quick sanity check that we actually got usable data
+      if (nrow(profile) > 0 && any(!is.na(profile$rss))) {
+        break
+      }
+    },
+    error = function(e) {
+      message(sprintf(
+        "syrup attempt %d/%d failed: %s",
+        attempt,
+        max_attempts,
+        e$message
+      ))
+    }
+  )
+  if (attempt < max_attempts) {
+    message(sprintf(
+      "syrup attempt %d returned empty/invalid profile",
+      attempt
+    ))
+    Sys.sleep(1)
+    gc(full = TRUE, verbose = FALSE)
+    Sys.sleep(1)
+  }
+}
+
+# Safe extraction
+max_rss <- as.numeric(max(profile$rss, na.rm = TRUE))
+wall_time <- as.numeric(
+  difftime(max(profile$time), min(profile$time), units = "secs")
+)
+outfile <- tibble::tibble(
+  method = argv$method,
+  cores = argv$cores,
+  rep = argv$rep,
+  max_rss = max_rss,
+  wall_time = wall_time,
+  attempt = attempt
+)
+
+outpath <- file.path(argv$output, paste0(prefix, ".profile.csv"))
+
+if (!file.exists(outpath) | argv$force) {
+  readr::write_csv(outfile, outpath)
+}
+```
+
+```{r}
+library(tidyverse)
+
+# fork is slower than psock due to R's GC behavior. Just use psock
+all_jobs <- tidyr::expand_grid(
+  method = c(
+    "knn", "knn_tree_chr", "impute.knn", "missMDA", "pca", "methyLImp2_psock"
+  ),
+  cores = c(1, 2, 4, 8),
+  rep = 1:5
+)
+# all_jobs$output <- with(all_jobs, glue::glue("output/{method}-{cores}-{rep}"))
+
+all_jobs$job <- with(
+  all_jobs,
+  glue::glue(
+    "Rscript benchmark.R",
+    "--beta GSE286313/GSE286313.EPICv2.chr1-Y.qs2",
+    "--group GSE286313/GSE286313.EPICv2.chr1-Y.group_df.qs2",
+    "--cores {cores}",
+    "--method {method}",
+    "--output benchmark/multi_cores/syrup",
+    "--rep {rep} ",
+    "--force",
+    .sep = " "
+  )
+)
+
+file.edit("benchmark.R")
+readr::write_lines(all_jobs$job, "joblist.txt")
 ```
 
 ## Slurm
