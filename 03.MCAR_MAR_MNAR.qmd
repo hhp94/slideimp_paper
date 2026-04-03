@@ -507,7 +507,7 @@ si_brute_fn <- function(x) {
 si_tree_fn <- function(x) {
   imputed_clocks <- rowSums(
     sweep(
-      knn_imp(x, k = k, subset = cpgs, tree = "ball", cores = cores)[, cpgs],
+      knn_imp(x, k = k, subset = cpgs, tree = TRUE, cores = cores)[, cpgs],
       2,
       cpgs_weights,
       FUN = "*"
