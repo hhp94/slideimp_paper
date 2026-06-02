@@ -27,7 +27,7 @@ for (pkg in pkgs$bioc) {
 
 for (pkg in pkgs$github) {
   pkg_name <- sub(".*/", "", pkg)
-  if (!rlang::is_installed(pkg_name)) remotes::install_github(pkg)
+  if (!rlang::is_installed(pkg_name)) pak::pak(pkg)
 }
 
 # Load libraries
@@ -37,7 +37,6 @@ library(bench)
 library(here)
 library(qs2)
 library(duckdb)
-library(ggplot2)
 library(tidyverse)
 library(slideimp.extra)
 source("utils.R")
@@ -81,6 +80,32 @@ qs2::qs_save(beta_matrix, here("GSE286313", "GSE286313.EPICv2.chr1-Y.qs2"))
 qs2::qs_save(group_df, here("GSE286313", "GSE286313.EPICv2.chr1-Y.group_df.qs2"))
 ```
 
+Test which solver is faster. "exact" is faster on this dataset.
+```{r}
+beta_matrix <- qs_read(get_DNAm("EPICv2", chr = "chr22")$path) |> t()
+dim(beta_matrix)
+beta_matrix <- beta_matrix[, mat_miss(beta_matrix, prop = TRUE) < 0.9]
+dim(beta_matrix)
+
+bench::mark(
+  exact = pca_imp(beta_matrix, ncp = 10),
+  lobpcg = pca_imp(beta_matrix, ncp = 10, solver = "lobpcg")
+)
+
+library(missMDA)
+library(tictoc)
+
+tic()
+pca_imputed <- imputePCA(beta_matrix, ncp = 10, scale = FALSE)$completeObs
+toc()
+exact <- pca_imp(beta_matrix, ncp = 10, scale = FALSE, colmax = 0.95, solver = "exact")
+
+all.equal(exact[, ], pca_imputed, tolerance = 1e-10)
+all.equal(exact[, ], pca_imputed, tolerance = 1e-12)
+all.equal(exact[, ], pca_imputed, tolerance = 1e-14)
+all.equal(exact[, ], pca_imputed, tolerance = 1e-16)
+```
+
 ## Script
 ```{r benchmark.R, eval = F}
 library(argparser)
@@ -95,42 +120,52 @@ p <- arg_parser("benchmark")
 p <- add_argument(p, "--beta", help = "beta matrix file path", type = "character")
 p <- add_argument(p, "--group", help = "group file path", type = "character")
 p <- add_argument(p, "--cores", help = "number of cores", type = "integer")
-p <- add_argument(
-  p, "--method",
-  help = "knn, knn_tree_chr, pca, missMDA, impute.knn, methyLImp2_psock",
-  type = "character"
-)
+p <- add_argument(p, "--method", help = "methods", type = "character")
 p <- add_argument(p, "--output", help = "output directory", type = "character")
-p <- add_argument(p, "--rep", help = "repetition number", type = "integer", default = 1L)
+p <- add_argument(
+  p, "--rep",
+  help = "repetition number", type = "integer", default = 1L
+)
 p <- add_argument(p, "--debug", help = "enable debug mode", flag = TRUE)
 p <- add_argument(p, "--force", help = "force", flag = TRUE)
 
 argv <- parse_args(
-  p,
-  c(
-    "--beta", here::here("GSE286313", "GSE286313.EPICv2.chr1-Y.qs2"),
-    "--group", here::here("GSE286313", "GSE286313.EPICv2.chr1-Y.group_df.qs2"),
-    "--cores", "1",
-    "--method", "knn",
-    "--output", here::here("benchmark", "multi_cores", "syrup"),
-    "--rep", "3"
-    # , "--debug"
-  )
+  p
+  # ,
+  # c(
+  #   "--beta", here::here("GSE286313", "GSE286313.EPICv2.chr1-Y.qs2"),
+  #   "--group", here::here("GSE286313", "GSE286313.EPICv2.chr1-Y.group_df.qs2"),
+  #   "--cores", "1",
+  #   "--method", "pca",
+  #   "--output", here::here("benchmark", "multi_cores", "syrup"),
+  #   "--rep", "3"
+  #   # , "--debug"
+  # )
 )
 
 stopifnot(
   argv$method %in% c(
-    "knn", "knn_tree_chr", "pca", "missMDA", "impute.knn", "methyLImp2_psock"
+    "knn",
+    "knn_tree_chr",
+    "pca",
+    "pca_chr",
+    "missMDA",
+    "impute.knn",
+    "methyLImp2_psock"
   )
 )
+
 set.seed(argv$rep)
+
 stopifnot(file.exists(argv$beta), file.exists(argv$group))
+
 if (!dir.exists(argv$output)) {
   dir.create(argv$output, recursive = TRUE)
 }
 
 beta_matrix <- qs2::qs_read(argv$beta)
 group_df <- qs2::qs_read(argv$group)
+names(group_df) <- c("feature", "group")
 
 if (argv$debug) {
   message("debug, ", argv$method, " ;cores, ", argv$cores)
@@ -152,6 +187,8 @@ run_knn <- function(beta_matrix, group_df, cores, .progress) {
     cores = cores,
     colmax = 0.98,
     post_imp = FALSE,
+    allow_unmapped = TRUE,
+    na_check = FALSE,
     .progress = .progress
   )
 }
@@ -167,10 +204,29 @@ run_knn_tree_chr <- function(beta_matrix, group_df, cores, .progress) {
     tree = TRUE,
     cores = 1,
     colmax = 0.98,
+    allow_unmapped = TRUE,
+    na_check = FALSE,
     .progress = .progress
   )
 }
 run_pca <- function(beta_matrix, group_df, cores, .progress) {
+  library(RhpcBLASctl)
+  blas_set_num_threads(cores) # not sure if this works in container
+  # this just runs with more thread
+  library(slideimp)
+  group_imp(
+    beta_matrix,
+    group = group_df,
+    ncp = 10,
+    maxiter = 5000,
+    colmax = 0.98,
+    allow_unmapped = TRUE,
+    na_check = FALSE,
+    solver = "exact",
+    .progress = .progress
+  )
+}
+run_pca_chr <- function(beta_matrix, group_df, cores, .progress) {
   library(slideimp)
   library(mirai)
   if (cores > 1) daemons(cores)
@@ -180,7 +236,11 @@ run_pca <- function(beta_matrix, group_df, cores, .progress) {
     group = group_df,
     ncp = 10,
     maxiter = 5000,
+    pin_blas = TRUE,
     colmax = 0.98,
+    allow_unmapped = TRUE,
+    na_check = FALSE,
+    solver = "exact",
     .progress = .progress
   )
 }
@@ -253,124 +313,98 @@ method_fn <- switch(argv$method,
   knn = \() run_knn(beta_matrix, group_df, argv$cores, .progress),
   knn_tree_chr = \() run_knn_tree_chr(beta_matrix, group_df, argv$cores, .progress),
   pca = \() run_pca(beta_matrix, group_df, argv$cores, .progress),
+  pca_chr = \() run_pca_chr(beta_matrix, group_df, argv$cores, .progress),
   missMDA = \() run_missMDA(beta_matrix, group_df, argv$cores, .progress),
   impute.knn = \() run_impute_knn(beta_matrix, group_df, argv$cores, .progress),
-  methyLImp2_psock = \() run_methyLImp2(beta_matrix, group_df, argv$cores, .progress, "methyLImp2_psock"),
-  # remove the fork version unless you really want it
+  methyLImp2_psock = \() run_methyLImp2(
+    beta_matrix, group_df, argv$cores, .progress, "methyLImp2_psock"
+  ),
   stop(paste("Unknown method:", argv$method))
 )
 
 prefix <- sprintf("%s-%d-%d", argv$method, argv$cores, argv$rep)
-max_attempts <- 5L
-profile <- NULL
-attempt <- 0L
-
-while (is.null(profile) && attempt < max_attempts) {
-  attempt <- attempt + 1L
-  tryCatch(
-    expr = {
-      profile <- syrup::syrup(invisible(method_fn()), interval = 0.25)
-      # Quick sanity check that we actually got usable data
-      if (nrow(profile) > 0 && any(!is.na(profile$rss))) {
-        break
-      }
-    },
-    error = function(e) {
-      message(sprintf(
-        "syrup attempt %d/%d failed: %s",
-        attempt,
-        max_attempts,
-        e$message
-      ))
-    }
-  )
-  if (attempt < max_attempts) {
-    message(sprintf(
-      "syrup attempt %d returned empty/invalid profile",
-      attempt
-    ))
-    Sys.sleep(1)
-    gc(full = TRUE, verbose = FALSE)
-    Sys.sleep(1)
-  }
-}
-
-# Safe extraction
-max_rss <- as.numeric(max(profile$rss, na.rm = TRUE))
-wall_time <- as.numeric(
-  difftime(max(profile$time), min(profile$time), units = "secs")
-)
-outfile <- tibble::tibble(
-  method = argv$method,
-  cores = argv$cores,
-  rep = argv$rep,
-  max_rss = max_rss,
-  wall_time = wall_time,
-  attempt = attempt
-)
-
-outpath <- file.path(argv$output, paste0(prefix, ".profile.csv"))
+outpath <- file.path(argv$output, paste0(prefix, ".profile.rds"))
 
 if (!file.exists(outpath) | argv$force) {
-  readr::write_csv(outfile, outpath)
-}
-```
+  max_attempts <- 5L
+  profile <- NULL
+  attempt <- 0L
 
-```{r}
-library(tidyverse)
+  while (is.null(profile) && attempt < max_attempts) {
+    attempt <- attempt + 1L
+    tryCatch(
+      expr = {
+        profile <- syrup(invisible(method_fn()), interval = 0.25)
+        # sanity check that we actually got usable data
+        if (nrow(profile) > 0 && any(!is.na(profile$rss))) {
+          break
+        }
+      },
+      error = function(e) {
+        message(sprintf(
+          "syrup attempt %d/%d failed: %s",
+          attempt,
+          max_attempts,
+          e$message
+        ))
+      }
+    )
+    if (attempt < max_attempts) {
+      message(sprintf(
+        "syrup attempt %d returned empty/invalid profile",
+        attempt
+      ))
+      Sys.sleep(1)
+      gc(full = TRUE, verbose = FALSE)
+      Sys.sleep(1)
+    }
+  }
 
-# fork is slower than psock due to R's GC behavior. Just use psock
-all_jobs <- tidyr::expand_grid(
-  method = c(
-    "knn", "knn_tree_chr", "impute.knn", "missMDA", "pca", "methyLImp2_psock"
-  ),
-  cores = c(1, 2, 4, 8),
-  rep = 1:5
-)
-# all_jobs$output <- with(all_jobs, glue::glue("output/{method}-{cores}-{rep}"))
+  # Safe extraction
+  max_rss <- max(profile$rss, na.rm = TRUE)
+  wall_time <- difftime(max(profile$time), min(profile$time), units = "secs")
 
-all_jobs$job <- with(
-  all_jobs,
-  glue::glue(
-    "Rscript benchmark.R",
-    "--beta GSE286313/GSE286313.EPICv2.chr1-Y.qs2",
-    "--group GSE286313/GSE286313.EPICv2.chr1-Y.group_df.qs2",
-    "--cores {cores}",
-    "--method {method}",
-    "--output benchmark/multi_cores/syrup",
-    "--rep {rep} ",
-    "--force",
-    .sep = " "
+  outfile <- tibble::tibble(
+    method = argv$method,
+    cores = argv$cores,
+    rep = argv$rep,
+    max_rss = max_rss,
+    wall_time = wall_time,
+    attempt = attempt
   )
-)
 
-file.edit("benchmark.R")
-readr::write_lines(all_jobs$job, "joblist.txt")
+  saveRDS(outfile, outpath)
+}
 ```
 
 ## Slurm
 ```{r}
 library(tidyverse)
 
-# fork is slower than psock due to R's GC behavior. Just use psock
 all_jobs <- tidyr::expand_grid(
   method = c(
-    "knn_tree_chr"
-    # "knn", "knn_tree_chr", "impute.knn", "missMDA", "pca", "methyLImp2_psock"
+    "knn", "pca", "knn_tree_chr", "pca_chr", "impute.knn", "missMDA",
+    "methyLImp2_psock"
   ),
   cores = c(1, 2, 4, 8),
   rep = 1:5
 )
 
-all_jobs$output <- with(all_jobs, glue::glue("output/{method}-{cores}-{rep}"))
-
-all_jobs$job <- with(all_jobs, glue::glue(
-  '/usr/bin/time -f "%U\\t%S\\t%e\\t%P\\t%M" -o {output}.txt',
-  "apptainer exec $APPTAINER/missRanger/missRanger.sif Rscript benchmark.R",
-  "--beta input/GSE286313.EPICv2.chr1-Y.qs2 --group input/GSE286313.EPICv2.chr1-Y.group_df.qs2",
-  "--cores {cores} --method {method}",
-  .sep = " "
-))
+# fork is slower than psock due to R's GC behavior. Just use psock
+all_jobs$job <- with(
+  all_jobs,
+  glue::glue(
+    "apptainer exec $APPTAINER/missRanger/missRanger.sif Rscript benchmark.R",
+    "--beta input/GSE286313.EPICv2.chr1-Y.qs2",
+    "--group input/GSE286313.EPICv2.chr1-Y.group_df.qs2",
+    "--cores {cores}",
+    "--method {method}",
+    "--output output",
+    "--rep {rep} ",
+    "--force",
+    .sep = " "
+  )
+)
 
 all_jobs <- tidyr::nest(all_jobs, .by = "cores")
 
@@ -388,14 +422,14 @@ purrr::walk2(
   }
 )
 
-max_jobs <- c(30, 10, 5, 5)
-max_mem <- c(15, 30, 40, 40)
+max_jobs <- c(10, 10, 5, 5)
+max_mem <- c(20, 20, 20, 20)
 
 all_jobs$dsq <- glue::glue(
   "dsq --job-file input/joblist_{all_jobs$cores}.txt --batch-file multi_cores_{all_jobs$cores}.sh",
   "--job-name multi_cores_{all_jobs$cores} --max-jobs {max_jobs}",
   "--output dSQ/dsq-multi_cores_{all_jobs$cores}-%A_%a-%N.out --status-dir .",
-  "--time 01:00:00 --nodes 1 --ntasks-per-node 1 --cpus-per-task {all_jobs$cores}",
+  "--time 02:00:00 --nodes 1 --ntasks-per-node 1 --cpus-per-task {all_jobs$cores}",
   "--mem {max_mem}G --partition day",
   .sep = " "
 ) |>
@@ -404,34 +438,29 @@ all_jobs$dsq <- glue::glue(
 all_jobs$dsq |> cat(sep = "\n")
 ```
 
+## Syrup Viz
+Ran the jobs using Slurm. We can use slurm sacc -j to query the actual RSS and Wall Time. The output/ results are less correct but can be used as backup.
+
 ```{r}
-library(here)
-library(hhprf)
-library(tidyverse)
-
-job_status <- tibble(
-  jl = here(
-    "benchmark", "multi_cores",
-    c(
-      "job_6962292_status.tsv"
-    )
-  ),
-  out = here(
-    "benchmark", "multi_cores",
-    c("joblist_2.txt")
-  )
-)
-
-map2(job_status$jl, job_status$out, hhprf::retry_dsq)
+# library(tidyverse)
+#
+# multi_cores <- tibble(
+#   files = list.files("benchmark/multi_cores/output"),
+#   paths = list.files("benchmark/multi_cores/output", full.names = TRUE)
+# )
+#
+# multi_cores$output <- lapply(multi_cores$paths, readRDS)
+# multi_cores <- unnest(multi_cores, cols = output)
+# multi_cores[c("files", "paths")] <- NULL
+#
+# saveRDS(multi_cores, here::here("benchmark", "multi_cores", "multi_cores_output.rds"))
 ```
 
-## Viz
-Ran the jobs using Slurm and /usr/time. We can use slurm sacc -j to query the actual RSS and Wall Time.
-
-The output/ results are less correct but can be used as backup.
-
+## sacct -j
 ```{r}
 library(tidyverse)
+library(glue)
+library(here)
 
 multi_cores <- tibble(
   files = list.files("benchmark/multi_cores/dSQ"),
@@ -439,19 +468,16 @@ multi_cores <- tibble(
 )
 
 multi_cores$output <- lapply(multi_cores$paths, read_lines)
-multi_cores$output |>
-  lapply(\(x) {
-    grepv("full run", x)
-  }) |>
-  unique()
 
 extractor <- function(x) {
-  method <- if (any(str_detect(x, "knn_tree_chr"))) {
+  if (any(str_detect(x, "knn_tree_chr"))) {
     "knn_tree_chr"
   } else if (any(str_detect(x, "impute.knn"))) {
     "impute.knn"
   } else if (any(str_detect(x, "knn"))) {
     "knn"
+  } else if (any(str_detect(x, "pca_chr"))) {
+    "pca_chr"
   } else if (any(str_detect(x, "pca"))) {
     "pca"
   } else if (any(str_detect(x, "missMDA"))) {
@@ -461,51 +487,69 @@ extractor <- function(x) {
   } else if (any(str_detect(x, "methyLImp2_fork"))) {
     "methyLImp2_fork"
   } else {
-    # stop("Failed: ", x)
     "remove"
   }
-  return(method)
 }
 
 multi_cores$method <- vapply(multi_cores$output, extractor, character(1))
-multi_cores <- multi_cores |> filter(method != "remove")
+
+multi_cores <- multi_cores |>
+  filter(method != "remove")
+
+# write_lines(
+#   paste(
+#     "rm",
+#     paste(
+#       dplyr::filter(
+#         multi_cores,
+#         method %in% c("pca", "pca_chr", "knn", "knn_tree_chr")
+#       )$files,
+#       collapse = " "
+#     )
+#   ),
+#   "command.txt"
+# )
+
 multi_cores$cores <- as.numeric(
   str_extract(multi_cores$files, "(?<=multi_cores_)\\d+(?=-)")
 )
+
 multi_cores$job_id <- str_extract(multi_cores$files, "(?<=-)[0-9]+_[0-9]+(?=-)")
-multi_cores[c("files", "paths", "output")] <- NULL
-multi_cores |> print(n = Inf)
+multi_cores <- multi_cores |>
+  select(-files, -paths, -output)
 
-cmd <- glue::glue(
-  "sacct -j", "{paste0(multi_cores$job_id, collapse = ',')}",
-  "--format=JobID,JobName,State,Elapsed,MaxRSS,TotalCPU",
-  "--parsable > multi_cores_raw.txt",
-  .sep = " "
+# print(multi_cores, n = Inf)
+
+cmd <- glue(
+  "sacct -j {paste0(multi_cores$job_id, collapse = ',')} ",
+  "--format=JobID,JobName,State,Elapsed,MaxRSS,TotalCPU ",
+  "--parsable > multi_cores_raw.txt"
 )
+cat(cmd, "\n") # Run this command manually in the shell
 
-cmd
-```
+# multi_cores <- tibble(
+#   files = list.files("benchmark/multi_cores/output"),
+#   paths = list.files("benchmark/multi_cores/output", full.names = TRUE)
+# )
+#
+# multi_cores$output <- lapply(multi_cores$paths, readRDS)
+# multi_cores <- unnest(multi_cores, cols = output)
+# multi_cores <- multi_cores |> select(-files, -paths)
 
-```{r}
-library(scales)
 multi_cores_raw <- read_delim(
   here::here("benchmark", "multi_cores", "multi_cores_raw.txt"),
-  delim = "|",
+  delim = "|"
 ) |>
   filter(State == "COMPLETED", JobName == "batch") |>
   mutate(
-    job_id = str_remove(JobID, ".batch"),
-    JobID = NULL,
-    State = NULL,
-    `...7` = NULL,
-    JobName = NULL,
+    job_id = str_remove(JobID, "\\.batch$"),
     max_rss_bytes = case_when(
-      str_detect(MaxRSS, "K$") ~ readr::parse_number(MaxRSS) * 1024,
-      str_detect(MaxRSS, "M$") ~ readr::parse_number(MaxRSS) * 1024^2,
-      TRUE ~ readr::parse_number(MaxRSS)
-    ),
-    MaxRSS = NULL
-  )
+      str_detect(MaxRSS, "K$") ~ parse_number(MaxRSS) * 1024,
+      str_detect(MaxRSS, "M$") ~ parse_number(MaxRSS) * 1024^2,
+      TRUE ~ parse_number(MaxRSS)
+    )
+  ) |>
+  select(-JobID, -State, -JobName, -MaxRSS, -`...7`)
 
 multi_cores_output <- inner_join(
   multi_cores,
@@ -1198,7 +1242,7 @@ argv <- parse_args(
     "--beta", "benchmark/group_imp/input/MSA.qs2",
     "--output", "benchmark/group_imp/output",
     "--rep", 1,
-    "--method", "knn",
+    "--method", "pca",
     "--group", "group"
   )
 )
